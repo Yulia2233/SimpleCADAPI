@@ -29,6 +29,7 @@ def _producer_version() -> str:
 def graph_capabilities_payload() -> Dict[str, Any]:
     return {
         "selection_ref_strategies": True,
+        "selected_subshape_signatures": True,
         "selector_hint_fallback": True,
         "display_payload": True,
         "topology_delta_summary": False,
@@ -409,6 +410,7 @@ def _node_display_summary(op: str, params: Dict[str, Any]) -> str:
         "selected_faces",
         "selected_edge_indices",
         "selected_face_indices",
+        "selected_subshapes",
     }
     summary_parts: List[str] = []
     for key, value in params.items():
@@ -430,7 +432,12 @@ def _node_display_summary(op: str, params: Dict[str, Any]) -> str:
 
 def _node_display_payload(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
     selection_count = 0
-    if isinstance(params.get("selected_edges"), list):
+    selected_subshapes = params.get("selected_subshapes")
+    if isinstance(selected_subshapes, dict) and isinstance(
+        selected_subshapes.get("items"), list
+    ):
+        selection_count = len(selected_subshapes["items"])
+    elif isinstance(params.get("selected_edges"), list):
         selection_count = len(params["selected_edges"])
     elif isinstance(params.get("selected_faces"), list):
         selection_count = len(params["selected_faces"])

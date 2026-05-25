@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+import warnings
 
 from .errors import raise_harness_error
 
@@ -37,6 +38,7 @@ from .topology import (
     topo_ref_from_dict,
 )
 from . import operations as ops
+from .selection_signature import match_selected_subshape_items, selected_subshape_items
 
 
 PUBLIC_API_COVERAGE: Dict[str, Dict[str, str]] = {
@@ -195,6 +197,7 @@ CANONICAL_CORE_OP_SET: Tuple[str, ...] = (
 )
 
 SELECTION_REF_SCHEMA: Dict[str, Any] = {
+    "selection_param": "selected_subshapes",
     "edge_param": "selected_edges",
     "face_param": "selected_faces",
     "edge_index_param": "selected_edge_indices",
@@ -206,12 +209,21 @@ SELECTION_REF_SCHEMA: Dict[str, Any] = {
         "kind",
         "topo_id",
     ],
-    "optional_fields": ["selector_hint"],
+    "required_item_fields": [
+        "item_id",
+        "kind",
+        "source",
+        "geometry_signature",
+        "original_selection_method",
+        "order",
+    ],
+    "optional_fields": ["selector_hint", "selection_query_debug"],
     "replay_resolution_order": [
+        "geometry_signature",
         "explicit_topo_refs",
-        "stable_indices",
-        "selection_query",
-        "selector_hint",
+        "legacy_index_fallback",
+        "legacy_selection_query",
+        "legacy_selector_hint",
     ],
 }
 
@@ -228,6 +240,7 @@ def _canonical_contract_payload() -> Dict[str, Any]:
         },
         "core_op_set": list(CANONICAL_CORE_OP_SET),
         "selection_ref_schema": {
+            "selection_param": SELECTION_REF_SCHEMA["selection_param"],
             "edge_param": SELECTION_REF_SCHEMA["edge_param"],
             "face_param": SELECTION_REF_SCHEMA["face_param"],
             "edge_index_param": SELECTION_REF_SCHEMA["edge_index_param"],
@@ -236,6 +249,7 @@ def _canonical_contract_payload() -> Dict[str, Any]:
                 SELECTION_REF_SCHEMA["required_topo_ref_fields"]
             ),
             "optional_fields": list(SELECTION_REF_SCHEMA["optional_fields"]),
+            "required_item_fields": list(SELECTION_REF_SCHEMA["required_item_fields"]),
             "replay_resolution_order": list(
                 SELECTION_REF_SCHEMA["replay_resolution_order"]
             ),
@@ -988,6 +1002,37 @@ def _resolve_faces_from_indices(solid: Solid, indices: Sequence[int]) -> List[Fa
     return [faces[idx] for idx in indices if 0 <= idx < len(faces)]
 
 
+def _warn_legacy_index_fallback(op_name: str) -> None:
+    warnings.warn(
+        f"{op_name} replay is using legacy selected_*_indices fallback because the graph has no selected_subshapes geometry signatures. "
+        "New graphs should store geometry signatures and should not rely on SimpleCAD/OCP index order.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _resolve_edges_from_selected_subshapes(
+    solid: Solid, params: Dict[str, Any], *, role: str
+) -> List[Edge]:
+    items = selected_subshape_items(params, kind="edge", role=role)
+    if not items:
+        items = selected_subshape_items(params, kind="edge")
+    if not items:
+        return []
+    return match_selected_subshape_items(solid.get_edges(), items, kind="edge")
+
+
+def _resolve_faces_from_selected_subshapes(
+    solid: Solid, params: Dict[str, Any], *, role: str
+) -> List[Face]:
+    items = selected_subshape_items(params, kind="face", role=role)
+    if not items:
+        items = selected_subshape_items(params, kind="face")
+    if not items:
+        return []
+    return match_selected_subshape_items(solid.get_faces(), items, kind="face")
+
+
 def _execute_graph(
     graph: OperationGraph, leaf_node_ids: Optional[Sequence[str]] = None
 ) -> List[AnyShape]:
@@ -1138,8 +1183,19 @@ def _execute_graph(
                     profile_outputs = outputs.get(node.inputs[0].node_id, [])
                     path_outputs = outputs.get(node.inputs[1].node_id, [])
                     if profile_outputs and path_outputs:
+                        profile = profile_outputs[0]
+                        face_items = selected_subshape_items(
+                            params, kind="face", role="sweep_profile_face"
+                        )
+                        if face_items:
+                            matched_faces = match_selected_subshape_items(
+                                cast(Solid, profile).get_faces(),
+                                face_items,
+                                kind="face",
+                            )
+                            profile = matched_faces[0]
                         result = ops.sweep_rsolid(
-                            cast(Any, profile_outputs[0]),
+                            cast(Any, profile),
                             cast(Any, path_outputs[0]),
                             is_frenet=bool(params.get("is_frenet", False)),
                         )
@@ -1165,31 +1221,35 @@ def _execute_graph(
                 )
                 if input_outputs:
                     solid = cast(Solid, input_outputs[0])
-                    selected_edges = cast(
-                        Sequence[Dict[str, Any]], params.get("selected_edges", [])
+                    edges = _resolve_edges_from_selected_subshapes(
+                        solid, params, role="fillet_edge"
                     )
-                    edges: List[Edge] = []
-                    edges = _resolve_edges_from_refs(solid, selected_edges)
-                    if len(edges) != len(selected_edges):
-                        edges = _resolve_edges_from_indices(
-                            solid,
-                            cast(
-                                Sequence[int],
-                                params.get("selected_edge_indices", []),
-                            ),
+                    if not edges:
+                        selected_edges = cast(
+                            Sequence[Dict[str, Any]], params.get("selected_edges", [])
                         )
-                    selection_query = params.get("selection_query")
-                    if len(edges) != len(selected_edges) and isinstance(
-                        selection_query, dict
-                    ):
-                        edges = cast(
-                            List[Edge],
-                            selector_from_dict(selection_query).resolve(solid),
-                        )
-                    if len(edges) != len(selected_edges):
-                        edges = _resolve_edges_from_selector_hints(
-                            solid, selected_edges
-                        )
+                        edges = _resolve_edges_from_refs(solid, selected_edges)
+                        if len(edges) != len(selected_edges):
+                            _warn_legacy_index_fallback(op_name)
+                            edges = _resolve_edges_from_indices(
+                                solid,
+                                cast(
+                                    Sequence[int],
+                                    params.get("selected_edge_indices", []),
+                                ),
+                            )
+                        selection_query = params.get("selection_query")
+                        if len(edges) != len(selected_edges) and isinstance(
+                            selection_query, dict
+                        ):
+                            edges = cast(
+                                List[Edge],
+                                selector_from_dict(selection_query).resolve(solid),
+                            )
+                        if len(edges) != len(selected_edges):
+                            edges = _resolve_edges_from_selector_hints(
+                                solid, selected_edges
+                            )
                     result = ops.fillet_rsolid(
                         solid,
                         edges,
@@ -1204,31 +1264,35 @@ def _execute_graph(
                 )
                 if input_outputs:
                     solid = cast(Solid, input_outputs[0])
-                    selected_edges = cast(
-                        Sequence[Dict[str, Any]], params.get("selected_edges", [])
+                    edges = _resolve_edges_from_selected_subshapes(
+                        solid, params, role="chamfer_edge"
                     )
-                    edges: List[Edge] = []
-                    edges = _resolve_edges_from_refs(solid, selected_edges)
-                    if len(edges) != len(selected_edges):
-                        edges = _resolve_edges_from_indices(
-                            solid,
-                            cast(
-                                Sequence[int],
-                                params.get("selected_edge_indices", []),
-                            ),
+                    if not edges:
+                        selected_edges = cast(
+                            Sequence[Dict[str, Any]], params.get("selected_edges", [])
                         )
-                    selection_query = params.get("selection_query")
-                    if len(edges) != len(selected_edges) and isinstance(
-                        selection_query, dict
-                    ):
-                        edges = cast(
-                            List[Edge],
-                            selector_from_dict(selection_query).resolve(solid),
-                        )
-                    if len(edges) != len(selected_edges):
-                        edges = _resolve_edges_from_selector_hints(
-                            solid, selected_edges
-                        )
+                        edges = _resolve_edges_from_refs(solid, selected_edges)
+                        if len(edges) != len(selected_edges):
+                            _warn_legacy_index_fallback(op_name)
+                            edges = _resolve_edges_from_indices(
+                                solid,
+                                cast(
+                                    Sequence[int],
+                                    params.get("selected_edge_indices", []),
+                                ),
+                            )
+                        selection_query = params.get("selection_query")
+                        if len(edges) != len(selected_edges) and isinstance(
+                            selection_query, dict
+                        ):
+                            edges = cast(
+                                List[Edge],
+                                selector_from_dict(selection_query).resolve(solid),
+                            )
+                        if len(edges) != len(selected_edges):
+                            edges = _resolve_edges_from_selector_hints(
+                                solid, selected_edges
+                            )
                     result = ops.chamfer_rsolid(
                         solid,
                         edges,
@@ -1243,31 +1307,35 @@ def _execute_graph(
                 )
                 if input_outputs:
                     solid = cast(Solid, input_outputs[0])
-                    selected_faces = cast(
-                        Sequence[Dict[str, Any]], params.get("selected_faces", [])
+                    faces = _resolve_faces_from_selected_subshapes(
+                        solid, params, role="shell_remove_face"
                     )
-                    faces: List[Face] = []
-                    faces = _resolve_faces_from_refs(solid, selected_faces)
-                    if len(faces) != len(selected_faces):
-                        faces = _resolve_faces_from_indices(
-                            solid,
-                            cast(
-                                Sequence[int],
-                                params.get("selected_face_indices", []),
-                            ),
+                    if not faces:
+                        selected_faces = cast(
+                            Sequence[Dict[str, Any]], params.get("selected_faces", [])
                         )
-                    selection_query = params.get("selection_query")
-                    if len(faces) != len(selected_faces) and isinstance(
-                        selection_query, dict
-                    ):
-                        faces = cast(
-                            List[Face],
-                            selector_from_dict(selection_query).resolve(solid),
-                        )
-                    if len(faces) != len(selected_faces):
-                        faces = _resolve_faces_from_selector_hints(
-                            solid, selected_faces
-                        )
+                        faces = _resolve_faces_from_refs(solid, selected_faces)
+                        if len(faces) != len(selected_faces):
+                            _warn_legacy_index_fallback(op_name)
+                            faces = _resolve_faces_from_indices(
+                                solid,
+                                cast(
+                                    Sequence[int],
+                                    params.get("selected_face_indices", []),
+                                ),
+                            )
+                        selection_query = params.get("selection_query")
+                        if len(faces) != len(selected_faces) and isinstance(
+                            selection_query, dict
+                        ):
+                            faces = cast(
+                                List[Face],
+                                selector_from_dict(selection_query).resolve(solid),
+                            )
+                        if len(faces) != len(selected_faces):
+                            faces = _resolve_faces_from_selector_hints(
+                                solid, selected_faces
+                            )
                     result = ops.shell_rsolid(
                         solid,
                         faces,
@@ -1282,25 +1350,27 @@ def _execute_graph(
                 try:
                     result = factory(params)
                     _store_outputs(node, result)
+                except ValueError:
+                    raise
                 except Exception as exc:
-                    raise ValueError(
-                        f"Failed to replay graph node '{node.node_id}' ({op_name}): {exc}"
+                    raise RuntimeError(
+                        f"Failed to replay node {node.node_id} ({op_name})"
                     ) from exc
-            else:
-                raise ValueError(
-                    f"No replay handler registered for graph node '{node.node_id}' ({op_name})"
-                )
+                continue
 
-    leaf_results: List[AnyShape] = []
-    if leaf_node_ids is None:
-        target_leaf_ids = [leaf.node_id for leaf in graph.leaf_nodes()]
-    else:
-        target_leaf_ids = [str(node_id) for node_id in leaf_node_ids]
-    for node_id in target_leaf_ids:
-        leaf_results.extend(outputs.get(node_id, []))
+            raise ValueError(f"Unsupported operation for replay: {op_name}")
 
-    return leaf_results
+    if leaf_node_ids:
+        selected: List[AnyShape] = []
+        for node_id in leaf_node_ids:
+            selected.extend(outputs.get(str(node_id), []))
+        return selected
 
+    leaves = graph.leaf_nodes()
+    result: List[AnyShape] = []
+    for leaf in leaves:
+        result.extend(outputs.get(leaf.node_id, []))
+    return result
 
 def replay_graph(graph: OperationGraph) -> List[AnyShape]:
     """Replay an OperationGraph to rebuild the model.

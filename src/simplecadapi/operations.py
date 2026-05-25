@@ -96,6 +96,7 @@ from .kernel.ocp_booleans import common_shapes, fuse_shapes, solids_of
 from .kernel.ocp_export import export_step_shapes, export_stl_shape, make_compound
 from .kernel.ocp_mesh import make_triangle_face, shell_is_closed, shell_metric, solid_from_shell, tessellate_face
 from .kernel.ocp_properties import bounding_box, distance as ocp_distance
+from .selection_signature import extract_geometry_signature
 
 
 _DEFAULT_UNION_GLUE = True
@@ -361,6 +362,9 @@ def _vector_like_to_tuple(value: Any) -> Optional[Tuple[float, float, float]]:
 
 
 def _make_selector_hint(shape: AnyShape) -> Dict[str, object]:
+    if isinstance(shape, (Edge, Face)):
+        return cast(Dict[str, object], extract_geometry_signature(shape))
+
     hint: Dict[str, object] = {
         "kind": type(shape).__name__.lower(),
         "tags": sorted(shape.get_tags()),
@@ -455,6 +459,152 @@ def _serialize_selection_indices(
         if topo_id in candidate_index_by_topo_id:
             result.append(candidate_index_by_topo_id[topo_id])
     return result
+
+
+def _selection_index_for_shape(
+    selected_shape: AnyShape, candidates: Sequence[AnyShape]
+) -> Optional[int]:
+    selected_topo_id = _shape_ref_topo_id(selected_shape)
+    for idx, candidate in enumerate(candidates):
+        candidate_topo_id = _shape_ref_topo_id(candidate)
+        if (
+            selected_topo_id is not None
+            and candidate_topo_id is not None
+            and selected_topo_id == candidate_topo_id
+        ):
+            return idx
+        try:
+            if selected_shape.same_topology(candidate):
+                return idx
+        except Exception:
+            pass
+    return None
+
+
+def _shape_source_payload(
+    shape: AnyShape, fallback_owner: Optional[AnyShape] = None
+) -> Dict[str, object]:
+    ref = _serialize_shape_ref(shape)
+    if ref is None and fallback_owner is not None:
+        ref = _serialize_shape_ref(fallback_owner)
+    if ref is None:
+        return {}
+    return {
+        "graph_id": ref.get("graph_id"),
+        "node_id": ref.get("node_id"),
+        "output_slot": ref.get("output_slot", 0),
+    }
+
+
+def _selected_subshape_item_id(
+    *, role: str, kind: str, order: int, shape: AnyShape
+) -> str:
+    topo_id = _shape_ref_topo_id(shape) or getattr(shape, "topo_id", None) or id(shape)
+    token = "".join(ch if str(ch).isalnum() else "_" for ch in str(topo_id)).strip("_")
+    return f"{role}_{kind}_{int(order)}_{token or 'shape'}"
+
+
+def _serialize_selected_subshapes(
+    owner: AnyShape,
+    selected_shapes: Sequence[AnyShape],
+    *,
+    kind: str,
+    role: str,
+    selection: Optional[Union[Sequence[AnyShape], ShapeSelector]] = None,
+) -> Dict[str, object]:
+    method = "ql" if isinstance(selection, ShapeSelector) else "index"
+    if kind == "edge" and hasattr(owner, "get_edges"):
+        candidates = list(cast(Any, owner).get_edges())
+    elif kind == "face" and hasattr(owner, "get_faces"):
+        candidates = list(cast(Any, owner).get_faces())
+    else:
+        candidates = list(selected_shapes)
+
+    items: List[Dict[str, object]] = []
+    for order, shape in enumerate(selected_shapes):
+        source = _shape_source_payload(shape, owner)
+        item: Dict[str, object] = {
+            "item_id": _selected_subshape_item_id(
+                role=role, kind=kind, order=order, shape=shape
+            ),
+            "kind": kind,
+            "role": role,
+            "source": source,
+            "source_shape_node": source.get("node_id"),
+            "geometry_signature": extract_geometry_signature(shape),
+            "original_selection_method": method,
+            "original_slice_position": order,
+            "order": order,
+        }
+        original_index = _selection_index_for_shape(shape, candidates)
+        if original_index is not None:
+            item["original_index"] = original_index
+        items.append(item)
+
+    owner_source = _shape_source_payload(owner)
+    payload: Dict[str, object] = {
+        "schema_version": "selected_subshapes.v1",
+        "source": owner_source,
+        "source_shape_node": owner_source.get("node_id"),
+        "kind": kind,
+        "role": role,
+        "selection_method": method,
+        "item_count": len(items),
+        "items": items,
+        "allow_duplicate_matches": False,
+    }
+    query = _serialize_selection_query(selection) if selection is not None else None
+    if query is not None:
+        payload["selection_query_debug"] = query
+    return payload
+
+
+def _selection_method_for_shape(shape: AnyShape, fallback: str = "index") -> str:
+    value = getattr(shape, "_get_runtime", lambda *_args, **_kwargs: None)(
+        "selection.method"
+    )
+    return str(value) if value is not None else fallback
+
+
+def _selected_subshape_from_existing_shape(
+    owner: AnyShape,
+    selected_shape: AnyShape,
+    *,
+    kind: str,
+    role: str,
+) -> Dict[str, object]:
+    method = _selection_method_for_shape(selected_shape)
+    payload = _serialize_selected_subshapes(
+        owner,
+        [selected_shape],
+        kind=kind,
+        role=role,
+        selection=None,
+    )
+    payload["selection_method"] = method
+    for item in cast(List[Dict[str, object]], payload.get("items", [])):
+        item["original_selection_method"] = method
+        query = getattr(selected_shape, "_get_runtime", lambda *_args, **_kwargs: None)(
+            "selection.query"
+        )
+        order = getattr(selected_shape, "_get_runtime", lambda *_args, **_kwargs: None)(
+            "selection.order"
+        )
+        if isinstance(query, dict):
+            item["selection_query_debug"] = query
+        if order is not None:
+            item["original_slice_position"] = int(order)
+    return payload
+
+
+def _selected_subshape_owner(shape: AnyShape, expected_type: type) -> Optional[AnyShape]:
+    for parent in shape.get_parents():
+        if isinstance(parent, expected_type):
+            return parent
+        owner = _selected_subshape_owner(parent, expected_type)
+        if owner is not None:
+            return owner
+    return None
 
 
 def _resolve_selector_or_shapes(
@@ -3880,6 +4030,13 @@ def fillet_rsolid(
             params={
                 "radius": radius,
                 "edge_count": len(selected_edges),
+                "selected_subshapes": _serialize_selected_subshapes(
+                    solid,
+                    selected_edges,
+                    kind="edge",
+                    role="fillet_edge",
+                    selection=edges,
+                ),
                 "selected_edges": _serialize_shape_refs(selected_edges),
                 "selected_edge_indices": _serialize_selection_indices(
                     selected_edges, solid.get_edges()
@@ -3939,6 +4096,13 @@ def chamfer_rsolid(
             params={
                 "distance": distance,
                 "edge_count": len(selected_edges),
+                "selected_subshapes": _serialize_selected_subshapes(
+                    solid,
+                    selected_edges,
+                    kind="edge",
+                    role="chamfer_edge",
+                    selection=edges,
+                ),
                 "selected_edges": _serialize_shape_refs(selected_edges),
                 "selected_edge_indices": _serialize_selection_indices(
                     selected_edges, solid.get_edges()
@@ -4003,6 +4167,13 @@ def shell_rsolid(
             params={
                 "thickness": thickness,
                 "removed_face_count": len(selected_faces),
+                "selected_subshapes": _serialize_selected_subshapes(
+                    solid,
+                    selected_faces,
+                    kind="face",
+                    role="shell_remove_face",
+                    selection=faces_to_remove,
+                ),
                 "selected_faces": _serialize_shape_refs(selected_faces),
                 "selected_face_indices": _serialize_selection_indices(
                     selected_faces, solid.get_faces()
@@ -4092,13 +4263,25 @@ def sweep_rsolid(profile: Face, path: Wire, is_frenet: bool = False) -> Solid:
         result._tags = profile._tags.union(path._tags)
         result._metadata = {**profile._metadata, **path._metadata}
 
+        input_shapes: List[AnyShape] = [profile, path]
+        params: Dict[str, object] = {"is_frenet": bool(is_frenet)}
+        profile_owner = _selected_subshape_owner(profile, Solid)
+        if profile_owner is not None:
+            params["selected_subshapes"] = _selected_subshape_from_existing_shape(
+                profile_owner,
+                profile,
+                kind="face",
+                role="sweep_profile_face",
+            )
+            input_shapes = [profile_owner, path]
+
         return _finalize_tracked_solid(
             result,
             op=_OP_MAKE_SWEEP_RSOLID,
-            params={"is_frenet": bool(is_frenet)},
+            params=params,
             delta=tracked.delta,
             delta_entries=cast(Dict[str, Dict[str, object]], tracked.delta_entries),
-            input_shapes=[profile, path],
+            input_shapes=input_shapes,
         )
     except Exception as e:
         _wrap_public_api_error(

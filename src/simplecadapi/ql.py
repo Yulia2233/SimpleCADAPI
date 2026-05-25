@@ -517,6 +517,12 @@ class ShapeSelector:
             raise ValueError(
                 f"QL selector expected exactly {exact} {self.target_kind}(s), got {len(items)}"
             )
+        for order, item in enumerate(items):
+            setter = getattr(item, "_set_runtime", None)
+            if callable(setter):
+                setter("selection.method", "ql")
+                setter("selection.query", self.to_dict())
+                setter("selection.order", order)
         return list(items)
 
     def to_dict(self) -> Dict[str, Any]:

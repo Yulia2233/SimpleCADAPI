@@ -364,14 +364,21 @@ class TestModelJson(unittest.TestCase):
         self.assertEqual(
             selection_schema["replay_resolution_order"],
             [
+                "geometry_signature",
                 "explicit_topo_refs",
-                "stable_indices",
-                "selection_query",
-                "selector_hint",
+                "legacy_index_fallback",
+                "legacy_selection_query",
+                "legacy_selector_hint",
             ],
         )
+        self.assertEqual(selection_schema["selection_param"], "selected_subshapes")
         self.assertEqual(selection_schema["edge_param"], "selected_edges")
         self.assertEqual(selection_schema["face_param"], "selected_faces")
+        selected_items = fillet_node["params"]["selected_subshapes"]["items"]
+        self.assertEqual(len(selected_items), 2)
+        self.assertEqual(selected_items[0]["kind"], "edge")
+        self.assertIn("geometry_signature", selected_items[0])
+        self.assertEqual(selected_items[0]["order"], 0)
         self.assertTrue(
             set(selection_schema["required_topo_ref_fields"]).issubset(
                 selected_edge_ref.keys()

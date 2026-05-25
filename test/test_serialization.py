@@ -390,6 +390,29 @@ class TestReplay(unittest.TestCase):
         self.assertIsInstance(results[0], scad.Solid)
         self.assertAlmostEqual(results[0].get_volume(), filleted.get_volume(), places=5)
 
+    def test_replay_ambiguous_selected_subshape_signature_raises(self):
+        with scad.GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 2.0, 2.0)
+            scad.fillet_rsolid(box, box.get_edges()[:1], 0.1)
+
+        payload = json.loads(export_graph_json(session.graph))
+        fillet_node = next(
+            node for node in payload["nodes"] if node["op"] == "make_fillet_rsolid"
+        )
+        signature = fillet_node["params"]["selected_subshapes"]["items"][0][
+            "geometry_signature"
+        ]
+        signature.pop("center", None)
+        signature.pop("midpoint", None)
+        signature.pop("endpoints", None)
+        signature.pop("bbox", None)
+        signature["curve_type"] = "line"
+        signature["length"] = 2.0
+
+        restored = import_graph_json(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, "ambiguous geometry signature"):
+            replay_graph(restored)
+
     def test_replay_shell_roundtrip_with_selector_hint_fallback(self):
         with scad.GraphSession() as session:
             box = scad.make_box_rsolid(4.0, 4.0, 4.0)

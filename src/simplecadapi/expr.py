@@ -387,6 +387,7 @@ def _is_discrete_param_name(key: str) -> bool:
         "profile_count",
         "count",
         "output_count",
+        "selected_subshapes",
     }
 
 

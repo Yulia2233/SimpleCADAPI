@@ -279,9 +279,11 @@ class TestRearchitecture20IoContracts(unittest.TestCase):
         self.assertEqual(
             selection_schema["replay_resolution_order"],
             [
+                "geometry_signature",
                 "explicit_topo_refs",
-                "stable_indices",
-                "selection_query",
-                "selector_hint",
+                "legacy_index_fallback",
+                "legacy_selection_query",
+                "legacy_selector_hint",
             ],
         )
+        self.assertEqual(selection_schema["selection_param"], "selected_subshapes")

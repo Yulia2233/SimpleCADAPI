@@ -1656,6 +1656,405 @@ def _resolve_vec3_param(params, param_exprs, key):
     )
 
 
+def _tuple3(value):
+    if value is None:
+        return None
+    if hasattr(value, 'x') and hasattr(value, 'y') and hasattr(value, 'z'):
+        return (float(value.x), float(value.y), float(value.z))
+    if hasattr(value, 'X') and hasattr(value, 'Y') and hasattr(value, 'Z'):
+        return (float(value.X()), float(value.Y()), float(value.Z()))
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return (float(value[0]), float(value[1]), float(value[2]))
+    return None
+
+
+def _point_payload(value):
+    vec = _tuple3(value)
+    if vec is None:
+        return None
+    return [float(vec[0]), float(vec[1]), float(vec[2])]
+
+
+def _normalized_tuple(value):
+    vec = _tuple3(value)
+    if vec is None:
+        return None
+    length = math.sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2])
+    if length <= 1e-12:
+        return None
+    return (vec[0] / length, vec[1] / length, vec[2] / length)
+
+
+def _shape_bbox_payload(shape):
+    bbox = shape.BoundBox
+    xmin, ymin, zmin = float(bbox.XMin), float(bbox.YMin), float(bbox.ZMin)
+    xmax, ymax, zmax = float(bbox.XMax), float(bbox.YMax), float(bbox.ZMax)
+    return {
+        'min': [xmin, ymin, zmin],
+        'max': [xmax, ymax, zmax],
+        'size': [xmax - xmin, ymax - ymin, zmax - zmin],
+    }
+
+
+def _curve_type(edge):
+    try:
+        curve = edge.Curve
+        name = type(curve).__name__.lower()
+        if 'line' in name:
+            return 'line'
+        if 'circle' in name:
+            first = float(getattr(edge, 'FirstParameter', 0.0))
+            last = float(getattr(edge, 'LastParameter', 0.0))
+            return 'circle' if abs(abs(last - first) - 2.0 * math.pi) <= 1e-5 else 'arc'
+        if 'bspline' in name:
+            return 'bspline'
+        if 'bezier' in name:
+            return 'bezier'
+        return name
+    except Exception:
+        return 'unknown'
+
+
+def _surface_type(face):
+    try:
+        surface = face.Surface
+        name = type(surface).__name__.lower()
+        if 'plane' in name:
+            return 'plane'
+        if 'cylinder' in name:
+            return 'cylinder'
+        if 'cone' in name:
+            return 'cone'
+        if 'sphere' in name:
+            return 'sphere'
+        if 'torus' in name:
+            return 'torus'
+        if 'bspline' in name:
+            return 'bspline'
+        if 'bezier' in name:
+            return 'bezier'
+        return name
+    except Exception:
+        return 'unknown'
+
+
+def _edge_endpoints(edge):
+    try:
+        verts = list(edge.Vertexes)
+        if len(verts) >= 2:
+            return [_point_payload(verts[0].Point), _point_payload(verts[-1].Point)]
+    except Exception:
+        pass
+    try:
+        return [
+            _point_payload(edge.valueAt(float(edge.FirstParameter))),
+            _point_payload(edge.valueAt(float(edge.LastParameter))),
+        ]
+    except Exception:
+        return None
+
+
+def _edge_midpoint(edge):
+    try:
+        first = float(edge.FirstParameter)
+        last = float(edge.LastParameter)
+        return _point_payload(edge.valueAt(0.5 * (first + last)))
+    except Exception:
+        try:
+            return _point_payload(edge.CenterOfMass)
+        except Exception:
+            return None
+
+
+def _edge_tangent(edge):
+    try:
+        first = float(edge.FirstParameter)
+        last = float(edge.LastParameter)
+        _, tangent = edge.tangentAt(0.5 * (first + last))
+        return list(_normalized_tuple(tangent) or ())
+    except Exception:
+        endpoints = _edge_endpoints(edge)
+        if endpoints and len(endpoints) == 2 and endpoints[0] is not None and endpoints[1] is not None:
+            start, end = endpoints
+            return list(_normalized_tuple((end[0] - start[0], end[1] - start[1], end[2] - start[2])) or ())
+    return None
+
+
+def _edge_radius(edge):
+    try:
+        curve = edge.Curve
+        radius = getattr(curve, 'Radius', None)
+        if radius is not None:
+            return float(radius)
+    except Exception:
+        pass
+    return None
+
+
+def _face_radius(face):
+    try:
+        surface = face.Surface
+        radius = getattr(surface, 'Radius', None)
+        if radius is not None:
+            return float(radius)
+        major = getattr(surface, 'MajorRadius', None)
+        if major is not None:
+            return float(major)
+    except Exception:
+        pass
+    return None
+
+
+def _geometry_signature(subshape, kind):
+    kind = str(kind).lower()
+    if kind == 'edge':
+        signature = {
+            'kind': 'edge',
+            'curve_type': _curve_type(subshape),
+            'length': float(subshape.Length),
+            'bbox': _shape_bbox_payload(subshape),
+            'tags': [],
+        }
+        center = _point_payload(getattr(subshape, 'CenterOfMass', None))
+        midpoint = _edge_midpoint(subshape)
+        tangent = _edge_tangent(subshape)
+        radius = _edge_radius(subshape)
+        endpoints = _edge_endpoints(subshape)
+        if center is not None:
+            signature['center'] = center
+        if midpoint is not None:
+            signature['midpoint'] = midpoint
+        if tangent:
+            signature['tangent'] = tangent
+            signature['direction'] = tangent
+        if radius is not None:
+            signature['radius'] = radius
+        if endpoints is not None:
+            signature['endpoints'] = endpoints
+        return signature
+    if kind == 'face':
+        signature = {
+            'kind': 'face',
+            'surface_type': _surface_type(subshape),
+            'area': float(subshape.Area),
+            'bbox': _shape_bbox_payload(subshape),
+            'tags': [],
+        }
+        center = _point_payload(getattr(subshape, 'CenterOfMass', None))
+        if center is not None:
+            signature['center'] = center
+        try:
+            u0, u1, v0, v1 = subshape.ParameterRange
+            normal = subshape.normalAt(0.5 * (float(u0) + float(u1)), 0.5 * (float(v0) + float(v1)))
+            norm = _normalized_tuple(normal)
+            if norm is not None:
+                signature['normal'] = list(norm)
+        except Exception:
+            pass
+        radius = _face_radius(subshape)
+        if radius is not None:
+            signature['radius'] = radius
+        return signature
+    raise RuntimeError(f'Unsupported selected subshape kind {kind!r}')
+
+
+def _bbox_scale(signature):
+    bbox = signature.get('bbox') if isinstance(signature, dict) else None
+    if isinstance(bbox, dict):
+        size = bbox.get('size')
+        if isinstance(size, (list, tuple)) and len(size) == 3:
+            try:
+                return max(math.sqrt(sum(float(v) * float(v) for v in size)), 1e-5)
+            except Exception:
+                pass
+    for key in ('length', 'radius'):
+        if isinstance(signature, dict) and key in signature:
+            try:
+                return max(abs(float(signature[key])), 1e-5)
+            except Exception:
+                pass
+    if isinstance(signature, dict) and 'area' in signature:
+        try:
+            return max(math.sqrt(abs(float(signature['area']))), 1e-5)
+        except Exception:
+            pass
+    return 1.0
+
+
+def _point_tol(target, candidate):
+    return max(1e-5, _bbox_scale(target) * 1e-6, _bbox_scale(candidate) * 1e-6)
+
+
+def _scalar_close(a, b):
+    try:
+        af = float(a)
+        bf = float(b)
+    except Exception:
+        return False
+    return abs(af - bf) <= max(1e-7, abs(af) * 1e-6, abs(bf) * 1e-6)
+
+
+def _distance3(a, b):
+    av = _tuple3(a)
+    bv = _tuple3(b)
+    if av is None or bv is None:
+        return None
+    return math.sqrt((av[0] - bv[0]) ** 2 + (av[1] - bv[1]) ** 2 + (av[2] - bv[2]) ** 2)
+
+
+def _vec_close(a, b, tol):
+    dist = _distance3(a, b)
+    return dist is not None and dist <= tol
+
+
+def _direction_close(a, b):
+    av = _normalized_tuple(a)
+    bv = _normalized_tuple(b)
+    if av is None or bv is None:
+        return False
+    return abs(av[0] * bv[0] + av[1] * bv[1] + av[2] * bv[2]) >= 1.0 - 1e-5
+
+
+def _bbox_close(a, b, tol):
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    return _vec_close(a.get('min'), b.get('min'), tol) and _vec_close(a.get('max'), b.get('max'), tol)
+
+
+def _endpoints_close(a, b, tol):
+    if not (
+        isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) and
+        len(a) == 2 and len(b) == 2
+    ):
+        return False
+    direct = _vec_close(a[0], b[0], tol) and _vec_close(a[1], b[1], tol)
+    reverse = _vec_close(a[0], b[1], tol) and _vec_close(a[1], b[0], tol)
+    return direct or reverse
+
+
+def _signatures_match(candidate, target, kind):
+    if not isinstance(candidate, dict) or not isinstance(target, dict):
+        return False
+    kind = str(kind).lower()
+    if str(candidate.get('kind', kind)).lower() != kind or str(target.get('kind', kind)).lower() != kind:
+        return False
+    compared = 0
+    tol = _point_tol(target, candidate)
+    type_key = 'curve_type' if kind == 'edge' else 'surface_type'
+    if target.get(type_key) and candidate.get(type_key):
+        compared += 1
+        if str(target[type_key]).lower() != str(candidate[type_key]).lower():
+            return False
+    for key in ('length', 'area', 'radius'):
+        if key in target and key in candidate:
+            compared += 1
+            if not _scalar_close(target[key], candidate[key]):
+                return False
+    for key in ('center', 'midpoint'):
+        if key in target and key in candidate:
+            compared += 1
+            if not _vec_close(target[key], candidate[key], tol):
+                return False
+    for key in ('normal', 'tangent', 'direction'):
+        if key in target and key in candidate:
+            compared += 1
+            if not _direction_close(target[key], candidate[key]):
+                return False
+    if 'bbox' in target and 'bbox' in candidate:
+        compared += 1
+        if not _bbox_close(target['bbox'], candidate['bbox'], tol):
+            return False
+    if 'endpoints' in target and 'endpoints' in candidate:
+        compared += 1
+        if not _endpoints_close(target['endpoints'], candidate['endpoints'], tol):
+            return False
+    return compared > 0
+
+
+def _signature_summary(signature):
+    if not isinstance(signature, dict):
+        return {}
+    keys = ('kind', 'surface_type', 'curve_type', 'center', 'midpoint', 'normal', 'length', 'area', 'radius', 'bbox')
+    return {key: signature[key] for key in keys if key in signature}
+
+
+def _selected_subshape_items(params, kind, role=None):
+    selected = params.get('selected_subshapes') if isinstance(params, dict) else None
+    if not isinstance(selected, dict) or not isinstance(selected.get('items'), list):
+        return []
+    result = []
+    for item in selected.get('items', []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get('kind', '')).lower() != str(kind).lower():
+            continue
+        if role is not None and str(item.get('role', '')).lower() != str(role).lower():
+            continue
+        result.append(item)
+    if not result and role is not None:
+        return _selected_subshape_items(params, kind)
+    return result
+
+
+def _selection_match_error(reason, item, kind, candidate_count, match_count):
+    signature = item.get('geometry_signature') if isinstance(item, dict) else {}
+    source = item.get('source') if isinstance(item, dict) and isinstance(item.get('source'), dict) else {}
+    selected_id = item.get('item_id', '<unknown>') if isinstance(item, dict) else '<unknown>'
+    method = item.get('original_selection_method') if isinstance(item, dict) else None
+    return RuntimeError(
+        'selected_subshape geometry match failed: '
+        f'{reason}; source node={source.get("node_id")}; '
+        f'selected_subshape id={selected_id}; kind={kind}; '
+        f'original selection method={method}; '
+        f'signature={_signature_summary(signature)}; '
+        f'matches={match_count}; candidates={candidate_count}'
+    )
+
+
+def _match_subshape_indices(obj, params, kind, role=None, allow_duplicate_matches=False):
+    items = _selected_subshape_items(params, kind, role)
+    if not items:
+        return None
+    shape = getattr(obj, 'Shape', obj)
+    try:
+        if shape is None or shape.isNull():
+            doc.recompute()
+            shape = getattr(obj, 'Shape', obj)
+    except Exception:
+        pass
+    if shape is None or shape.isNull():
+        raise RuntimeError(f'Source object {getattr(obj, "Name", "<unknown>")} has no valid shape')
+    candidates = list(shape.Edges if str(kind).lower() == 'edge' else shape.Faces)
+    candidate_signatures = [_geometry_signature(candidate, kind) for candidate in candidates]
+    used = set()
+    result = []
+    for item in items:
+        target = item.get('geometry_signature') if isinstance(item.get('geometry_signature'), dict) else None
+        if target is None:
+            raise _selection_match_error('missing geometry_signature', item, kind, len(candidates), 0)
+        matches = [idx for idx, candidate in enumerate(candidate_signatures) if _signatures_match(candidate, target, kind)]
+        if not matches:
+            raise _selection_match_error('no candidate matched the stored geometry signature', item, kind, len(candidates), 0)
+        if len(matches) > 1:
+            raise _selection_match_error('ambiguous geometry signature matched multiple candidates', item, kind, len(candidates), len(matches))
+        idx = matches[0]
+        if idx in used and not allow_duplicate_matches:
+            raise _selection_match_error('duplicate selection items matched the same candidate', item, kind, len(candidates), 1)
+        used.add(idx)
+        result.append(idx + 1)
+    return result
+
+
+def _legacy_edge_indices(params):
+    print('SimpleCAD warning: using legacy selected_edge_indices fallback; new graphs should use selected_subshapes geometry signatures.')
+    return [int(idx) + 1 for idx in params.get('selected_edge_indices', [])]
+
+
+def _legacy_face_names(params):
+    print('SimpleCAD warning: using legacy selected_face_indices fallback; new graphs should use selected_subshapes geometry signatures.')
+    return ['Face' + str(int(i) + 1) for i in params.get('selected_face_indices', [])]
+
+
 def _make_native_assembly(name):
     if Assembly is None:
         return None
@@ -2232,8 +2631,17 @@ def _joint_reference_from_anchor(anchor):
 
         if node.op == "make_sweep_rsolid" and len(inputs) == 2:
             lines = [
+                f"{var_name}_profile_obj = GRAPH_NODES[{_json_ascii(inputs[0])}]",
+                f"{var_name}_profile_face_indices = _match_subshape_indices({var_name}_profile_obj, {rp}, 'face', 'sweep_profile_face')",
                 f"{var_name} = doc.addObject('Part::Sweep', {_json_ascii(object_name)})",
-                f"{var_name}.Sections = [GRAPH_NODES[{_json_ascii(inputs[0])}]]",
+                f"if {var_name}_profile_face_indices is None:",
+                f"    {var_name}.Sections = [{var_name}_profile_obj]",
+                f"else:",
+                f"    {var_name}_profile_shape = {var_name}_profile_obj.Shape.Faces[int({var_name}_profile_face_indices[0]) - 1]",
+                f"    {var_name}_profile_feature = doc.addObject('Part::Feature', {_json_ascii(_safe_name(f'{object_name}_profile', prefix='profile'))})",
+                f"    {var_name}_profile_feature.Shape = {var_name}_profile_shape",
+                f"    _set_visibility({var_name}_profile_feature, False)",
+                f"    {var_name}.Sections = [{var_name}_profile_feature]",
                 f"{var_name}.Spine = GRAPH_NODES[{_json_ascii(inputs[1])}]",
                 f"{var_name}.Solid = True",
                 f"{var_name}.Frenet = bool(_resolve_param_value({rp}, {re}, 'is_frenet') if 'is_frenet' in {rp} else False)",
@@ -2299,7 +2707,10 @@ def _joint_reference_from_anchor(anchor):
             lines = [
                 f"{var_name} = doc.addObject('Part::Fillet', {_json_ascii(object_name)})",
                 f"{var_name}.Base = GRAPH_NODES[{_json_ascii(inputs[0])}]",
-                f"{var_name}.Edges = [(int(idx) + 1, float(_resolve_param_value({rp}, {re}, 'radius')), float(_resolve_param_value({rp}, {re}, 'radius'))) for idx in {rp}.get('selected_edge_indices', [])]",
+                f"{var_name}_edge_indices = _match_subshape_indices(GRAPH_NODES[{_json_ascii(inputs[0])}], {rp}, 'edge', 'fillet_edge')",
+                f"if {var_name}_edge_indices is None:",
+                f"    {var_name}_edge_indices = _legacy_edge_indices({rp})",
+                f"{var_name}.Edges = [(int(idx), float(_resolve_param_value({rp}, {re}, 'radius')), float(_resolve_param_value({rp}, {re}, 'radius'))) for idx in {var_name}_edge_indices]",
             ]
             lines.append(f"_apply_detail_feature_bindings({var_name}, {re}, 'radius')")
             lines.extend(finish())
@@ -2309,7 +2720,10 @@ def _joint_reference_from_anchor(anchor):
             lines = [
                 f"{var_name} = doc.addObject('Part::Chamfer', {_json_ascii(object_name)})",
                 f"{var_name}.Base = GRAPH_NODES[{_json_ascii(inputs[0])}]",
-                f"{var_name}.Edges = [(int(idx) + 1, float(_resolve_param_value({rp}, {re}, 'distance')), float(_resolve_param_value({rp}, {re}, 'distance'))) for idx in {rp}.get('selected_edge_indices', [])]",
+                f"{var_name}_edge_indices = _match_subshape_indices(GRAPH_NODES[{_json_ascii(inputs[0])}], {rp}, 'edge', 'chamfer_edge')",
+                f"if {var_name}_edge_indices is None:",
+                f"    {var_name}_edge_indices = _legacy_edge_indices({rp})",
+                f"{var_name}.Edges = [(int(idx), float(_resolve_param_value({rp}, {re}, 'distance')), float(_resolve_param_value({rp}, {re}, 'distance'))) for idx in {var_name}_edge_indices]",
             ]
             lines.append(
                 f"_apply_detail_feature_bindings({var_name}, {re}, 'distance')"
@@ -2325,8 +2739,15 @@ def _joint_reference_from_anchor(anchor):
             lines.append(
                 f"_apply_op_expression_bindings({var_name}, {_json_ascii(node.op)}, {re})"
             )
-            if node.params.get("selected_face_indices"):
-                face_name_expr = f"['Face' + str(int(i) + 1) for i in {rp}.get('selected_face_indices', [])]"
+            if node.params.get("selected_subshapes") or node.params.get(
+                "selected_face_indices"
+            ):
+                face_name_expr = f"['Face' + str(int(i)) for i in {var_name}_face_indices]"
+                lines.append(
+                    f"{var_name}_face_indices = _match_subshape_indices(GRAPH_NODES[{_json_ascii(inputs[0])}], {rp}, 'face', 'shell_remove_face')"
+                )
+                lines.append(f"if {var_name}_face_indices is None:")
+                lines.append(f"    {var_name}_face_indices = [int(name[4:]) for name in _legacy_face_names({rp})]")
                 lines.append(
                     f"{var_name}.Faces = (GRAPH_NODES[{_json_ascii(inputs[0])}], {face_name_expr})"
                 )

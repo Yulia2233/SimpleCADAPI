@@ -364,6 +364,107 @@ with open(OUT_PATH, 'w', encoding='utf-8') as fh:
         self.assertIn(".Frenet = bool(", script)
         self.assertIn("'Frenet'", script)
 
+    def test_ql_selected_extrusion_face_sweep_records_signature(self):
+        with GraphSession() as session:
+            profile = scad.make_circle_rface((0.0, 0.0, 0.0), 1.0)
+            solid = scad.extrude_rsolid(profile, (0.0, 0.0, 1.0), 2.0)
+            top_face = (
+                scad.ql.faces()
+                .where(scad.ql.prop("geom.normal.z", ">", 0.9))
+                .take(1)
+                .exactly(1)
+                .resolve(solid)[0]
+            )
+            path_edge = scad.make_line_redge((0.0, 0.0, 2.0), (0.0, 0.0, 4.0))
+            path = scad.make_wire_from_edges_rwire([path_edge])
+            scad.sweep_rsolid(top_face, path)
+
+        payload = json.loads(scad.export_model_json(session))
+        sweep_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_sweep_rsolid"
+        )
+        selected = sweep_node["params"]["selected_subshapes"]
+        item = selected["items"][0]
+
+        self.assertEqual(selected["item_count"], 1)
+        self.assertEqual(item["kind"], "face")
+        self.assertEqual(item["role"], "sweep_profile_face")
+        self.assertEqual(item["original_selection_method"], "ql")
+        self.assertEqual(item["order"], 0)
+        self.assertIn("geometry_signature", item)
+        self.assertEqual(item["geometry_signature"]["kind"], "face")
+        self.assertEqual(item["geometry_signature"]["surface_type"], "plane")
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("_match_subshape_indices", script)
+        self.assertIn("sweep_profile_face", script)
+        self.assertIn("_profile_feature.Shape", script)
+
+    def test_index_edge_selection_for_fillet_records_ordered_signatures(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(3.0, 4.0, 5.0)
+            scad.fillet_rsolid(box, box.get_edges()[:2], 0.2)
+
+        payload = json.loads(scad.export_model_json(session))
+        fillet_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_fillet_rsolid"
+        )
+        selected = fillet_node["params"]["selected_subshapes"]
+        items = selected["items"]
+
+        self.assertEqual(selected["item_count"], 2)
+        self.assertEqual([item["order"] for item in items], [0, 1])
+        self.assertEqual(
+            [item["original_selection_method"] for item in items], ["index", "index"]
+        )
+        self.assertTrue(all("geometry_signature" in item for item in items))
+        self.assertTrue(all(item["kind"] == "edge" for item in items))
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("_match_subshape_indices", script)
+        self.assertIn("'fillet_edge'", script)
+        self.assertIn("_legacy_edge_indices", script)
+        self.assertNotIn(
+            ".Edges = [(int(idx) + 1",
+            script,
+        )
+
+    def test_index_face_selection_for_shell_records_ordered_signatures(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(3.0, 4.0, 5.0)
+            scad.shell_rsolid(box, box.get_faces()[1:3], 0.1)
+
+        payload = json.loads(scad.export_model_json(session))
+        shell_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_shell_rsolid"
+        )
+        selected = shell_node["params"]["selected_subshapes"]
+        items = selected["items"]
+
+        self.assertEqual(selected["item_count"], 2)
+        self.assertEqual([item["order"] for item in items], [0, 1])
+        self.assertTrue(all(item["kind"] == "face" for item in items))
+        self.assertTrue(all("geometry_signature" in item for item in items))
+        self.assertEqual(items[0]["original_index"], 1)
+        self.assertEqual(items[1]["original_index"], 2)
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("_match_subshape_indices", script)
+        self.assertIn("'shell_remove_face'", script)
+        self.assertIn("_legacy_face_names", script)
+        face_assignment = next(
+            line for line in script.splitlines() if ".Faces = (GRAPH_NODES" in line
+        )
+        self.assertIn("node_", face_assignment)
+        self.assertIn("face_indices", face_assignment)
+        self.assertNotIn("selected_face_indices", face_assignment)
+
     def test_translate_model_json_uses_single_result_union_helper(self):
         graph = OperationGraph(graph_id="graph_union_single")
         a = graph.add_node(
@@ -507,6 +608,127 @@ with open(OUT_PATH, 'w', encoding='utf-8') as fh:
         self.assertTrue(result["wire_closed"])
         self.assertTrue(result["wire_valid"])
         self.assertTrue(result["face_valid"])
+
+    def test_freecad_matches_index_selected_edge_by_signature_not_index(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            selected_edge = box.get_edges()[2]
+            expected_signature = selected_edge.get_center()
+            scad.fillet_rsolid(box, [selected_edge], 0.1)
+
+        payload = json.loads(scad.export_model_json(session))
+        fillet_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_fillet_rsolid"
+        )
+        fillet_node["params"]["selected_edge_indices"] = [0]
+        payload_text = json.dumps(payload)
+        probe = f"""
+import json
+import FreeCAD as App
+
+doc = App.openDocument(FCSTD_PATH)
+fillet = [obj for obj in doc.Objects if getattr(obj, 'SimpleCADOp', '') == 'make_fillet_rsolid'][-1]
+base = fillet.Base.Shape
+target_center = ({float(expected_signature.x)}, {float(expected_signature.y)}, {float(expected_signature.z)})
+matched = []
+for edge_id, radius1, radius2 in fillet.Edges:
+    edge = base.Edges[int(edge_id) - 1]
+    center = edge.CenterOfMass
+    matched.append([int(edge_id), float(center.x), float(center.y), float(center.z)])
+with open(OUT_PATH, 'w', encoding='utf-8') as fh:
+    json.dump({{
+        'edges': matched,
+        'target_center': target_center,
+    }}, fh)
+"""
+        result = self._inspect_fcstd_json(payload_text, probe)
+        self.assertEqual(len(result["edges"]), 1)
+        self.assertEqual(
+            [round(v, 6) for v in result["edges"][0][1:]],
+            [round(v, 6) for v in result["target_center"]],
+        )
+
+    def test_freecad_matches_index_selected_shell_face_by_signature_not_index(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            selected_face = box.get_faces()[2]
+            expected_center = selected_face.get_center()
+            scad.shell_rsolid(box, [selected_face], 0.1)
+
+        payload = json.loads(scad.export_model_json(session))
+        shell_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_shell_rsolid"
+        )
+        shell_node["params"]["selected_face_indices"] = [0]
+        payload_text = json.dumps(payload)
+        probe = f"""
+import json
+import FreeCAD as App
+
+doc = App.openDocument(FCSTD_PATH)
+shell = [obj for obj in doc.Objects if getattr(obj, 'SimpleCADOp', '') == 'make_shell_rsolid'][-1]
+source, names = shell.Faces
+target_center = ({float(expected_center.x)}, {float(expected_center.y)}, {float(expected_center.z)})
+matched = []
+for name in names:
+    idx = int(str(name)[4:]) - 1
+    face = source.Shape.Faces[idx]
+    center = face.CenterOfMass
+    matched.append([name, float(center.x), float(center.y), float(center.z)])
+with open(OUT_PATH, 'w', encoding='utf-8') as fh:
+    json.dump({{
+        'faces': matched,
+        'target_center': target_center,
+    }}, fh)
+"""
+        result = self._inspect_fcstd_json(payload_text, probe)
+        self.assertEqual(len(result["faces"]), 1)
+        self.assertEqual(
+            [round(v, 6) for v in result["faces"][0][1:]],
+            [round(v, 6) for v in result["target_center"]],
+        )
+
+    def test_freecad_ambiguous_signature_raises_instead_of_taking_first(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 2.0, 2.0)
+            scad.fillet_rsolid(box, box.get_edges()[:1], 0.1)
+
+        payload = json.loads(scad.export_model_json(session))
+        fillet_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_fillet_rsolid"
+        )
+        item = fillet_node["params"]["selected_subshapes"]["items"][0]
+        signature = item["geometry_signature"]
+        signature.pop("center", None)
+        signature.pop("midpoint", None)
+        signature.pop("endpoints", None)
+        signature.pop("bbox", None)
+        signature["curve_type"] = "line"
+        signature["length"] = 2.0
+
+        freecad_cmd = self._discover_freecadcmd()
+        if not freecad_cmd:
+            self.skipTest("freecadcmd not available")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            script_path = os.path.join(tmp_dir, "ambiguous.py")
+            script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write(script)
+            result = subprocess.run(
+                [freecad_cmd, script_path],
+                text=True,
+                capture_output=True,
+            )
+        self.assertIn(
+            "ambiguous geometry signature matched multiple candidates",
+            result.stderr + result.stdout,
+        )
 
     def test_translate_model_json_multi_tool_cut_affects_fcstd_result(self):
         with GraphSession() as session:
