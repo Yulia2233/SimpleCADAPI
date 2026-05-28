@@ -2045,6 +2045,73 @@ def _match_subshape_indices(obj, params, kind, role=None, allow_duplicate_matche
     return result
 
 
+def _selected_subshape_features(obj, params, kind, role, name_prefix, allow_duplicate_matches=False):
+    indices = _match_subshape_indices(
+        obj,
+        params,
+        kind,
+        role,
+        allow_duplicate_matches=allow_duplicate_matches,
+    )
+    if indices is None:
+        return None
+    shape = getattr(obj, 'Shape', obj)
+    candidates = list(shape.Edges if str(kind).lower() == 'edge' else shape.Faces)
+    features = []
+    for order, idx in enumerate(indices):
+        feature = doc.addObject('Part::Feature', f'{name_prefix}_{order}')
+        feature.Shape = candidates[int(idx) - 1]
+        _set_visibility(feature, False)
+        features.append(feature)
+    return features
+
+
+def _selected_edge_wire_feature(obj, selection_payload, name):
+    wrapper = {'selected_subshapes': selection_payload}
+    edge_features = _selected_subshape_features(obj, wrapper, 'edge', None, f'{name}_edge')
+    if not edge_features:
+        return None
+    feature = doc.addObject('Part::Feature', name)
+    feature.Shape = Part.Wire([edge.Shape for edge in edge_features])
+    _set_visibility(feature, False)
+    return feature
+
+
+def _selected_edge_wire_feature_from_sources(selection_payload, name):
+    items = selection_payload.get('items') if isinstance(selection_payload, dict) else None
+    if not isinstance(items, list):
+        return None
+    edge_features = []
+    for order, item in enumerate(items):
+        source = item.get('source') if isinstance(item, dict) else None
+        source_node = source.get('node_id') if isinstance(source, dict) else None
+        if not source_node:
+            raise RuntimeError('selected edge item is missing source node_id')
+        source_obj = GRAPH_NODES[str(source_node)]
+        wrapper = {'selected_subshapes': {'items': [item]}}
+        matched = _selected_subshape_features(source_obj, wrapper, 'edge', None, f'{name}_edge_{order}')
+        if not matched:
+            raise RuntimeError('selected edge item did not match its source shape')
+        edge_features.extend(matched)
+    feature = doc.addObject('Part::Feature', name)
+    feature.Shape = Part.Wire([edge.Shape for edge in edge_features])
+    _set_visibility(feature, False)
+    return feature
+
+
+def _selected_source_feature(obj, params, edge_role, face_role, name):
+    selected_kind = str(params.get('selected_source_kind', '')).lower()
+    if selected_kind == 'wire':
+        return _selected_edge_wire_feature(obj, params.get('selected_subshapes'), name)
+    face_features = _selected_subshape_features(obj, params, 'face', face_role, name)
+    if face_features:
+        return face_features[0]
+    edge_features = _selected_subshape_features(obj, params, 'edge', edge_role, name)
+    if edge_features:
+        return edge_features[0]
+    return None
+
+
 def _legacy_edge_indices(params):
     print('SimpleCAD warning: using legacy selected_edge_indices fallback; new graphs should use selected_subshapes geometry signatures.')
     return [int(idx) + 1 for idx in params.get('selected_edge_indices', [])]
@@ -2256,6 +2323,14 @@ def _joint_reference_from_anchor(anchor):
 
         if node.op == "make_wire_from_edges_rwire":
             input_nodes = [graph.get_node(node_id) for node_id in inputs]
+            if node.params.get("selected_subshapes"):
+                lines = [
+                    f"{var_name}_wire_feature = _selected_edge_wire_feature_from_sources({rp}.get('selected_subshapes'), {_json_ascii(_safe_name(object_name, prefix='wire'))})",
+                    f"if {var_name}_wire_feature is None:",
+                    f"    raise RuntimeError('make_wire_from_edges_rwire expected selected_subshapes geometry signatures for wire_edge')",
+                    f"{var_name} = _register_graph_object({var_name}_wire_feature, node_id={_json_ascii(node.node_id)}, op={_json_ascii(node.op)}, params={rp}, inputs={var_name}_inputs, tags={tags_literal}, context={context_literal}, output_count={node.output_count}, param_exprs={param_exprs_literal}, semantic_delta={semantic_delta_literal}, topo_delta={topo_delta_literal})",
+                ]
+                return lines
             if len(inputs) == 1:
                 single = input_nodes[0]
                 if single is not None and single.op == "make_helix_redge":
@@ -2501,6 +2576,15 @@ def _joint_reference_from_anchor(anchor):
             return lines
 
         if node.op == "make_face_from_wire_rface":
+            if node.params.get("selected_subshapes") and len(inputs) == 1:
+                lines = [
+                    f"{var_name}_wire_feature = _selected_edge_wire_feature(GRAPH_NODES[{_json_ascii(inputs[0])}], {rp}.get('selected_subshapes'), {_json_ascii(_safe_name(f'{object_name}_wire', prefix='wire'))})",
+                    f"if {var_name}_wire_feature is None:",
+                    f"    raise RuntimeError('make_face_from_wire_rface expected selected_subshapes geometry signatures for face_boundary_edge')",
+                    f"{var_name} = _build_face_from_source({var_name}_wire_feature, {_json_ascii(object_name)})",
+                ]
+                lines.extend(finish())
+                return lines
             input_node = graph.get_node(inputs[0]) if inputs else None
             if input_node is not None and input_node.op == "make_wire_from_edges_rwire":
                 return finish_alias(inputs[0])
@@ -2573,6 +2657,24 @@ def _joint_reference_from_anchor(anchor):
 
         if node.op == "make_extrude_rsolid" and len(inputs) == 1:
             base_node = graph.get_node(inputs[0])
+            if node.params.get("selected_subshapes"):
+                lines = [
+                    f"{var_name}_profile_features = _selected_subshape_features(GRAPH_NODES[{_json_ascii(inputs[0])}], {rp}, 'face', 'extrude_profile_face', {_json_ascii(_safe_name(f'{object_name}_profile', prefix='profile'))})",
+                    f"if not {var_name}_profile_features:",
+                    f"    raise RuntimeError('make_extrude_rsolid expected selected_subshapes geometry signatures for extrude_profile_face')",
+                    f"{var_name} = doc.addObject('Part::Extrusion', {_json_ascii(object_name)})",
+                    f"{var_name}.Base = {var_name}_profile_features[0]",
+                    f"{var_name}.DirMode = 'Custom'",
+                    f"{var_name}.Dir = _vec(_resolve_vec3_param({rp}, {re}, 'direction'))",
+                    f"{var_name}.LengthFwd = float(_resolve_param_value({rp}, {re}, 'distance'))",
+                    f"{var_name}.LengthRev = 0.0",
+                    f"{var_name}.Solid = True",
+                ]
+                lines.append(
+                    f"_apply_op_expression_bindings({var_name}, {_json_ascii(node.op)}, {re})"
+                )
+                lines.extend(finish())
+                return lines
             if base_node is not None and base_node.op in {
                 "make_face_from_wire_rface",
                 "make_wire_from_edges_rwire",
@@ -2601,6 +2703,23 @@ def _joint_reference_from_anchor(anchor):
 
         if node.op == "make_revolve_rsolid" and len(inputs) == 1:
             base_node = graph.get_node(inputs[0])
+            if node.params.get("selected_subshapes"):
+                lines = [
+                    f"{var_name}_profile_features = _selected_subshape_features(GRAPH_NODES[{_json_ascii(inputs[0])}], {rp}, 'face', 'revolve_profile_face', {_json_ascii(_safe_name(f'{object_name}_profile', prefix='profile'))})",
+                    f"if not {var_name}_profile_features:",
+                    f"    raise RuntimeError('make_revolve_rsolid expected selected_subshapes geometry signatures for revolve_profile_face')",
+                    f"{var_name} = doc.addObject('Part::Revolution', {_json_ascii(object_name)})",
+                    f"{var_name}.Source = {var_name}_profile_features[0]",
+                    f"{var_name}.Axis = _vec(_resolve_vec3_param({rp}, {re}, 'axis') if 'axis' in {rp} else (0.0, 0.0, 1.0))",
+                    f"{var_name}.Base = _vec(_resolve_vec3_param({rp}, {re}, 'origin') if 'origin' in {rp} else (0.0, 0.0, 0.0))",
+                    f"{var_name}.Angle = float(_resolve_param_value({rp}, {re}, 'angle') if 'angle' in {rp} else 360.0)",
+                    f"{var_name}.Solid = True",
+                ]
+                lines.append(
+                    f"_apply_op_expression_bindings({var_name}, {_json_ascii(node.op)}, {re})"
+                )
+                lines.extend(finish())
+                return lines
             if base_node is not None and base_node.op == "make_face_from_wire_rface":
                 lines = [
                     f"{var_name} = doc.addObject('Part::Revolution', {_json_ascii(object_name)})",
@@ -2617,12 +2736,27 @@ def _joint_reference_from_anchor(anchor):
                 return lines
 
         if node.op == "make_loft_rsolid" and len(inputs) >= 2:
-            lines = [
-                f"{var_name} = doc.addObject('Part::Loft', {_json_ascii(object_name)})",
-                f"{var_name}.Sections = [GRAPH_NODES[node_id] for node_id in {var_name}_inputs]",
-                f"{var_name}.Solid = True",
-                f"{var_name}.Ruled = bool(_resolve_param_value({rp}, {re}, 'ruled') if 'ruled' in {rp} else False)",
-            ]
+            if node.params.get("selected_profile_subshapes"):
+                lines = [
+                    f"{var_name}_sections = []",
+                    f"for _idx, _selection_payload in enumerate({rp}.get('selected_profile_subshapes', [])):",
+                    f"    _owner = GRAPH_NODES[{var_name}_inputs[_idx]]",
+                    f"    _wire_feature = _selected_edge_wire_feature(_owner, _selection_payload, f'{_safe_name(object_name, prefix='loft_profile')}_{{_idx}}')",
+                    f"    if _wire_feature is None:",
+                    f"        raise RuntimeError('make_loft_rsolid expected selected_profile_subshapes geometry signatures')",
+                    f"    {var_name}_sections.append(_wire_feature)",
+                    f"{var_name} = doc.addObject('Part::Loft', {_json_ascii(object_name)})",
+                    f"{var_name}.Sections = {var_name}_sections",
+                    f"{var_name}.Solid = True",
+                    f"{var_name}.Ruled = bool(_resolve_param_value({rp}, {re}, 'ruled') if 'ruled' in {rp} else False)",
+                ]
+            else:
+                lines = [
+                    f"{var_name} = doc.addObject('Part::Loft', {_json_ascii(object_name)})",
+                    f"{var_name}.Sections = [GRAPH_NODES[node_id] for node_id in {var_name}_inputs]",
+                    f"{var_name}.Solid = True",
+                    f"{var_name}.Ruled = bool(_resolve_param_value({rp}, {re}, 'ruled') if 'ruled' in {rp} else False)",
+                ]
             lines.append(
                 f"_apply_op_expression_bindings({var_name}, {_json_ascii(node.op)}, {re})"
             )
@@ -2633,6 +2767,13 @@ def _joint_reference_from_anchor(anchor):
             lines = [
                 f"{var_name}_profile_obj = GRAPH_NODES[{_json_ascii(inputs[0])}]",
                 f"{var_name}_profile_face_indices = _match_subshape_indices({var_name}_profile_obj, {rp}, 'face', 'sweep_profile_face')",
+                f"{var_name}_path_obj = GRAPH_NODES[{_json_ascii(inputs[1])}]",
+                f"if isinstance({rp}.get('selected_path_subshapes'), dict):",
+                f"    {var_name}_path_feature = _selected_edge_wire_feature({var_name}_path_obj, {rp}.get('selected_path_subshapes'), {_json_ascii(_safe_name(f'{object_name}_path', prefix='path'))})",
+                f"    if {var_name}_path_feature is None:",
+                f"        raise RuntimeError('make_sweep_rsolid expected selected_path_subshapes geometry signatures')",
+                f"else:",
+                f"    {var_name}_path_feature = {var_name}_path_obj",
                 f"{var_name} = doc.addObject('Part::Sweep', {_json_ascii(object_name)})",
                 f"if {var_name}_profile_face_indices is None:",
                 f"    {var_name}.Sections = [{var_name}_profile_obj]",
@@ -2642,7 +2783,7 @@ def _joint_reference_from_anchor(anchor):
                 f"    {var_name}_profile_feature.Shape = {var_name}_profile_shape",
                 f"    _set_visibility({var_name}_profile_feature, False)",
                 f"    {var_name}.Sections = [{var_name}_profile_feature]",
-                f"{var_name}.Spine = GRAPH_NODES[{_json_ascii(inputs[1])}]",
+                f"{var_name}.Spine = {var_name}_path_feature",
                 f"{var_name}.Solid = True",
                 f"{var_name}.Frenet = bool(_resolve_param_value({rp}, {re}, 'is_frenet') if 'is_frenet' in {rp} else False)",
             ]
@@ -2756,8 +2897,13 @@ def _joint_reference_from_anchor(anchor):
 
         if node.op == "make_mirror_rshape" and len(inputs) == 1:
             lines = [
+                f"{var_name}_source = GRAPH_NODES[{_json_ascii(inputs[0])}]",
+                f"if {rp}.get('selected_subshapes'):",
+                f"    {var_name}_source = _selected_source_feature({var_name}_source, {rp}, 'mirror_source_edge', 'mirror_source_face', {_json_ascii(_safe_name(f'{object_name}_source', prefix='source'))})",
+                f"    if {var_name}_source is None:",
+                f"        raise RuntimeError('make_mirror_rshape expected selected_subshapes geometry signatures for selected source shape')",
                 f"{var_name} = doc.addObject('Part::Mirroring', {_json_ascii(object_name)})",
-                f"{var_name}.Source = GRAPH_NODES[{_json_ascii(inputs[0])}]",
+                f"{var_name}.Source = {var_name}_source",
                 f"{var_name}.Base = _vec(_resolve_vec3_param({rp}, {re}, 'plane_origin') if 'plane_origin' in {rp} else (0.0, 0.0, 0.0))",
                 f"{var_name}.Normal = _vec(_resolve_vec3_param({rp}, {re}, 'plane_normal') if 'plane_normal' in {rp} else (0.0, 0.0, 1.0))",
             ]
@@ -2771,13 +2917,21 @@ def _joint_reference_from_anchor(anchor):
             vector = node.params.get("vector")
             if isinstance(vector, (list, tuple)) and len(vector) == 3:
                 try:
-                    if all(abs(float(v)) <= 1e-12 for v in vector):
+                    if (
+                        all(abs(float(v)) <= 1e-12 for v in vector)
+                        and not node.params.get("selected_subshapes")
+                    ):
                         return finish_alias(inputs[0])
                 except Exception:
                     pass
             lines = [
+                f"{var_name}_linked = GRAPH_NODES[{_json_ascii(inputs[0])}]",
+                f"if {rp}.get('selected_subshapes'):",
+                f"    {var_name}_linked = _selected_source_feature({var_name}_linked, {rp}, 'translate_source_edge', 'translate_source_face', {_json_ascii(_safe_name(f'{object_name}_source', prefix='source'))})",
+                f"    if {var_name}_linked is None:",
+                f"        raise RuntimeError('make_translate_rshape expected selected_subshapes geometry signatures for selected source shape')",
                 f"{var_name} = doc.addObject('App::Link', {_json_ascii(object_name)})",
-                f"{var_name}.LinkedObject = GRAPH_NODES[{_json_ascii(inputs[0])}]",
+                f"{var_name}.LinkedObject = {var_name}_linked",
                 f"{var_name}.Placement = App.Placement(_vec(_resolve_vec3_param({rp}, {re}, 'vector')), App.Rotation())",
             ]
             lines.append(
@@ -2788,8 +2942,13 @@ def _joint_reference_from_anchor(anchor):
 
         if node.op == "make_rotate_rshape" and len(inputs) == 1:
             lines = [
+                f"{var_name}_linked = GRAPH_NODES[{_json_ascii(inputs[0])}]",
+                f"if {rp}.get('selected_subshapes'):",
+                f"    {var_name}_linked = _selected_source_feature({var_name}_linked, {rp}, 'rotate_source_edge', 'rotate_source_face', {_json_ascii(_safe_name(f'{object_name}_source', prefix='source'))})",
+                f"    if {var_name}_linked is None:",
+                f"        raise RuntimeError('make_rotate_rshape expected selected_subshapes geometry signatures for selected source shape')",
                 f"{var_name} = doc.addObject('App::Link', {_json_ascii(object_name)})",
-                f"{var_name}.LinkedObject = GRAPH_NODES[{_json_ascii(inputs[0])}]",
+                f"{var_name}.LinkedObject = {var_name}_linked",
                 f"{var_name}.Placement = App.Placement(_vec(_resolve_vec3_param({rp}, {re}, 'origin') if 'origin' in {rp} else (0.0, 0.0, 0.0)), App.Rotation(_vec(_resolve_vec3_param({rp}, {re}, 'axis') if 'axis' in {rp} else (0.0, 0.0, 1.0)), float(_resolve_param_value({rp}, {re}, 'angle'))))",
             ]
             lines.append(

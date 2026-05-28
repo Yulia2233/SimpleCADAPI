@@ -360,7 +360,8 @@ with open(OUT_PATH, 'w', encoding='utf-8') as fh:
         script = scad.translate_model_json_to_freecad_script(json.dumps(payload_obj))
 
         self.assertIn("Part::Sweep", script)
-        self.assertIn(".Spine = GRAPH_NODES", script)
+        self.assertIn("_path_feature", script)
+        self.assertIn(".Spine =", script)
         self.assertIn(".Frenet = bool(", script)
         self.assertIn("'Frenet'", script)
 
@@ -401,6 +402,221 @@ with open(OUT_PATH, 'w', encoding='utf-8') as fh:
         self.assertIn("_match_subshape_indices", script)
         self.assertIn("sweep_profile_face", script)
         self.assertIn("_profile_feature.Shape", script)
+
+    def test_existing_solid_face_extrude_records_profile_signature(self):
+        with GraphSession() as session:
+            profile = scad.make_circle_rface((0.0, 0.0, 0.0), 1.0)
+            base = scad.extrude_rsolid(profile, (0.0, 0.0, 1.0), 2.0)
+            top_face = (
+                scad.ql.faces()
+                .where(scad.ql.prop("geom.normal.z", ">", 0.9))
+                .take(1)
+                .exactly(1)
+                .resolve(base)[0]
+            )
+            scad.extrude_rsolid(top_face, (0.0, 0.0, 1.0), 1.0)
+
+        payload = json.loads(scad.export_model_json(session))
+        extrude_nodes = [
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_extrude_rsolid"
+        ]
+        selected_extrude = extrude_nodes[-1]
+        selected = selected_extrude["params"]["selected_subshapes"]
+        item = selected["items"][0]
+
+        self.assertEqual(selected_extrude["inputs"], [extrude_nodes[0]["node_id"]])
+        self.assertEqual(selected["role"], "extrude_profile_face")
+        self.assertEqual(item["kind"], "face")
+        self.assertEqual(item["original_selection_method"], "ql")
+        self.assertIn("geometry_signature", item)
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("'extrude_profile_face'", script)
+        self.assertIn("_selected_subshape_features", script)
+        self.assertIn(".Base =", script)
+
+    def test_existing_solid_face_revolve_records_profile_signature(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            face = box.get_faces()[0]
+            scad.revolve_rsolid(face, axis=(0.0, 1.0, 0.0), angle=90.0)
+
+        payload = json.loads(scad.export_model_json(session))
+        revolve_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_revolve_rsolid"
+        )
+        selected = revolve_node["params"]["selected_subshapes"]
+
+        self.assertEqual(selected["role"], "revolve_profile_face")
+        self.assertEqual(selected["items"][0]["kind"], "face")
+        self.assertIn("geometry_signature", selected["items"][0])
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("'revolve_profile_face'", script)
+        self.assertIn(".Source =", script)
+
+    def test_existing_solid_edge_wire_records_edge_signatures(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(3.0, 4.0, 5.0)
+            scad.make_wire_from_edges_rwire([box.get_edges()[0]])
+
+        payload = json.loads(scad.export_model_json(session))
+        wire_nodes = [
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_wire_from_edges_rwire"
+        ]
+        selected_wire = wire_nodes[-1]
+        selected = selected_wire["params"]["selected_subshapes"]
+
+        self.assertEqual(selected["role"], "wire_edge")
+        self.assertEqual(selected["item_count"], 1)
+        self.assertEqual(selected["items"][0]["kind"], "edge")
+        self.assertIn("geometry_signature", selected["items"][0])
+        self.assertEqual(len(selected_wire["inputs"]), 1)
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("'wire_edge'", script)
+        self.assertIn("_selected_edge_wire_feature_from_sources", script)
+
+    def test_face_from_existing_solid_wire_records_boundary_signatures(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(3.0, 4.0, 5.0)
+            top_face = max(box.get_faces(), key=lambda face: face.get_center().z)
+            boundary = top_face.get_outer_wire()
+            scad.make_face_from_wire_rface(boundary, normal=(0.0, 0.0, 1.0))
+
+        payload = json.loads(scad.export_model_json(session))
+        face_nodes = [
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_face_from_wire_rface"
+        ]
+        selected_face_node = face_nodes[-1]
+        selected = selected_face_node["params"]["selected_subshapes"]
+
+        self.assertEqual(selected["role"], "face_boundary_edge")
+        self.assertEqual(selected["item_count"], 4)
+        self.assertEqual([item["order"] for item in selected["items"]], [0, 1, 2, 3])
+        self.assertTrue(all(item["kind"] == "edge" for item in selected["items"]))
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("'face_boundary_edge'", script)
+        self.assertIn("_selected_edge_wire_feature", script)
+
+    def test_loft_from_existing_solid_wires_records_profile_signatures(self):
+        with GraphSession() as session:
+            lower = scad.make_box_rsolid(3.0, 3.0, 1.0)
+            upper = scad.translate_shape(scad.make_box_rsolid(2.0, 2.0, 1.0), (0, 0, 3))
+            lower_top = max(lower.get_faces(), key=lambda face: face.get_center().z)
+            upper_top = max(upper.get_faces(), key=lambda face: face.get_center().z)
+            scad.loft_rsolid(
+                [lower_top.get_outer_wire(), upper_top.get_outer_wire()],
+                ruled=True,
+            )
+
+        payload = json.loads(scad.export_model_json(session))
+        loft_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_loft_rsolid"
+        )
+        selected_profiles = loft_node["params"]["selected_profile_subshapes"]
+
+        self.assertEqual(len(selected_profiles), 2)
+        self.assertEqual(
+            [payload["role"] for payload in selected_profiles],
+            ["loft_profile_0_edge", "loft_profile_1_edge"],
+        )
+        self.assertTrue(
+            all(
+                item["kind"] == "edge"
+                for payload in selected_profiles
+                for item in payload["items"]
+            )
+        )
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("selected_profile_subshapes", script)
+        self.assertIn("_selected_edge_wire_feature", script)
+
+    def test_transform_existing_solid_face_records_source_signature(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            top_face = max(box.get_faces(), key=lambda face: face.get_center().z)
+            scad.translate_shape(top_face, (1.0, 0.0, 0.0))
+
+        payload = json.loads(scad.export_model_json(session))
+        translate_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_translate_rshape"
+        )
+        selected = translate_node["params"]["selected_subshapes"]
+        item = selected["items"][0]
+
+        self.assertEqual(selected["role"], "translate_source_face")
+        self.assertEqual(translate_node["params"]["selected_source_kind"], "face")
+        self.assertEqual(item["kind"], "face")
+        self.assertIn("geometry_signature", item)
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("_selected_source_feature", script)
+        self.assertIn("'translate_source_face'", script)
+
+    def test_transform_existing_solid_edge_records_source_signature(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            scad.rotate_shape(box.get_edges()[1], 45.0, axis=(0.0, 0.0, 1.0))
+
+        payload = json.loads(scad.export_model_json(session))
+        rotate_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_rotate_rshape"
+        )
+        selected = rotate_node["params"]["selected_subshapes"]
+        item = selected["items"][0]
+
+        self.assertEqual(selected["role"], "rotate_source_edge")
+        self.assertEqual(rotate_node["params"]["selected_source_kind"], "edge")
+        self.assertEqual(item["kind"], "edge")
+        self.assertIn("geometry_signature", item)
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("_selected_source_feature", script)
+        self.assertIn("'rotate_source_edge'", script)
+
+    def test_transform_existing_solid_wire_records_source_edge_signatures(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            top_face = max(box.get_faces(), key=lambda face: face.get_center().z)
+            scad.mirror_shape(
+                top_face.get_outer_wire(),
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+            )
+
+        payload = json.loads(scad.export_model_json(session))
+        mirror_node = next(
+            node
+            for node in payload["graph"]["nodes"]
+            if node["op"] == "make_mirror_rshape"
+        )
+        selected = mirror_node["params"]["selected_subshapes"]
+
+        self.assertEqual(selected["role"], "mirror_source_edge")
+        self.assertEqual(mirror_node["params"]["selected_source_kind"], "wire")
+        self.assertEqual(selected["item_count"], 4)
+        self.assertTrue(all(item["kind"] == "edge" for item in selected["items"]))
+
+        script = scad.translate_model_json_to_freecad_script(json.dumps(payload))
+        self.assertIn("_selected_source_feature", script)
+        self.assertIn("'mirror_source_edge'", script)
 
     def test_index_edge_selection_for_fillet_records_ordered_signatures(self):
         with GraphSession() as session:
@@ -690,6 +906,145 @@ with open(OUT_PATH, 'w', encoding='utf-8') as fh:
         self.assertEqual(
             [round(v, 6) for v in result["faces"][0][1:]],
             [round(v, 6) for v in result["target_center"]],
+        )
+
+    def test_freecad_extrudes_existing_solid_face_by_signature(self):
+        with GraphSession() as session:
+            profile = scad.make_circle_rface((0.0, 0.0, 0.0), 1.0)
+            base = scad.extrude_rsolid(profile, (0.0, 0.0, 1.0), 2.0)
+            top_face = (
+                scad.ql.faces()
+                .where(scad.ql.prop("geom.normal.z", ">", 0.9))
+                .take(1)
+                .exactly(1)
+                .resolve(base)[0]
+            )
+            expected_center = top_face.get_center()
+            scad.extrude_rsolid(top_face, (0.0, 0.0, 1.0), 1.0)
+
+        payload_text = scad.export_model_json(session)
+        probe = f"""
+import json
+import FreeCAD as App
+
+doc = App.openDocument(FCSTD_PATH)
+extrudes = [obj for obj in doc.Objects if getattr(obj, 'SimpleCADOp', '') == 'make_extrude_rsolid']
+target = extrudes[-1]
+base = target.Base.Shape
+center = base.CenterOfMass
+with open(OUT_PATH, 'w', encoding='utf-8') as fh:
+    json.dump({{
+        'extrude_count': len(extrudes),
+        'target_base_type': base.ShapeType,
+        'target_base_center': [float(center.x), float(center.y), float(center.z)],
+        'expected_center': [{float(expected_center.x)}, {float(expected_center.y)}, {float(expected_center.z)}],
+        'is_null': target.Shape.isNull(),
+    }}, fh)
+"""
+        result = self._inspect_fcstd_json(payload_text, probe)
+        self.assertEqual(result["extrude_count"], 2)
+        self.assertEqual(result["target_base_type"], "Face")
+        self.assertFalse(result["is_null"])
+        self.assertEqual(
+            [round(v, 6) for v in result["target_base_center"]],
+            [round(v, 6) for v in result["expected_center"]],
+        )
+
+    def test_freecad_wire_from_existing_solid_edge_matches_signature(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            selected_edge = box.get_edges()[2]
+            expected_center = selected_edge.get_center()
+            scad.make_wire_from_edges_rwire([selected_edge])
+
+        payload_text = scad.export_model_json(session)
+        probe = f"""
+import json
+import FreeCAD as App
+
+doc = App.openDocument(FCSTD_PATH)
+wires = [obj for obj in doc.Objects if getattr(obj, 'SimpleCADOp', '') == 'make_wire_from_edges_rwire']
+target = wires[-1]
+edge = target.Shape.Edges[0]
+center = edge.CenterOfMass
+with open(OUT_PATH, 'w', encoding='utf-8') as fh:
+    json.dump({{
+        'wire_edge_count': len(target.Shape.Edges),
+        'wire_center': [float(center.x), float(center.y), float(center.z)],
+        'expected_center': [{float(expected_center.x)}, {float(expected_center.y)}, {float(expected_center.z)}],
+    }}, fh)
+"""
+        result = self._inspect_fcstd_json(payload_text, probe)
+        self.assertEqual(result["wire_edge_count"], 1)
+        self.assertEqual(
+            [round(v, 6) for v in result["wire_center"]],
+            [round(v, 6) for v in result["expected_center"]],
+        )
+
+    def test_freecad_face_from_existing_solid_wire_matches_boundary_signatures(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            top_face = max(box.get_faces(), key=lambda face: face.get_center().z)
+            expected_area = top_face.get_area()
+            face = scad.make_face_from_wire_rface(
+                top_face.get_outer_wire(), normal=(0.0, 0.0, 1.0)
+            )
+            scad.extrude_rsolid(face, (0.0, 0.0, 1.0), 1.0)
+
+        payload_text = scad.export_model_json(session)
+        probe = f"""
+import json
+import FreeCAD as App
+
+doc = App.openDocument(FCSTD_PATH)
+faces = [obj for obj in doc.Objects if getattr(obj, 'SimpleCADOp', '') == 'make_face_from_wire_rface']
+target = faces[-1]
+with open(OUT_PATH, 'w', encoding='utf-8') as fh:
+    json.dump({{
+        'shape_type': target.Shape.ShapeType,
+        'area': float(target.Shape.Area),
+        'expected_area': {float(expected_area)},
+        'edge_count': len(target.Shape.Edges),
+    }}, fh)
+"""
+        result = self._inspect_fcstd_json(payload_text, probe)
+        self.assertEqual(result["shape_type"], "Face")
+        self.assertEqual(result["edge_count"], 4)
+        self.assertAlmostEqual(result["area"], result["expected_area"], places=5)
+
+    def test_freecad_sweep_path_from_existing_solid_edge_matches_signature(self):
+        with GraphSession() as session:
+            box = scad.make_box_rsolid(2.0, 3.0, 4.0)
+            selected_edge = box.get_edges()[2]
+            expected_center = selected_edge.get_center()
+            path = scad.make_wire_from_edges_rwire([selected_edge])
+            profile = scad.make_circle_rface((0.0, 0.0, 0.0), 0.2)
+            scad.sweep_rsolid(profile, path)
+
+        payload_text = scad.export_model_json(session)
+        probe = f"""
+import json
+import FreeCAD as App
+
+doc = App.openDocument(FCSTD_PATH)
+sweep = [obj for obj in doc.Objects if getattr(obj, 'SimpleCADOp', '') == 'make_sweep_rsolid'][-1]
+spine = sweep.Spine[0] if isinstance(sweep.Spine, tuple) else sweep.Spine
+edge = spine.Shape.Edges[0]
+center = edge.CenterOfMass
+with open(OUT_PATH, 'w', encoding='utf-8') as fh:
+    json.dump({{
+        'spine_edge_count': len(spine.Shape.Edges),
+        'spine_center': [float(center.x), float(center.y), float(center.z)],
+        'expected_center': [{float(expected_center.x)}, {float(expected_center.y)}, {float(expected_center.z)}],
+        'is_null': sweep.Shape.isNull(),
+    }}, fh)
+"""
+        result = self._inspect_fcstd_json(payload_text, probe)
+        self.assertEqual(result["spine_edge_count"], 1)
+        self.assertFalse(result["is_null"])
+        self.assertEqual(
+            [round(v, 6) for v in result["spine_center"]],
+            [round(v, 6) for v in result["expected_center"]],
         )
 
     def test_freecad_ambiguous_signature_raises_instead_of_taking_first(self):

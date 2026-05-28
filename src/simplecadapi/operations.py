@@ -597,6 +597,40 @@ def _selected_subshape_from_existing_shape(
     return payload
 
 
+def _selected_subshapes_from_existing_shapes(
+    owner: AnyShape,
+    selected_shapes: Sequence[AnyShape],
+    *,
+    kind: str,
+    role: str,
+) -> Dict[str, object]:
+    methods = [_selection_method_for_shape(shape) for shape in selected_shapes]
+    method = methods[0] if methods and all(value == methods[0] for value in methods) else "index"
+    payload = _serialize_selected_subshapes(
+        owner,
+        selected_shapes,
+        kind=kind,
+        role=role,
+        selection=None,
+    )
+    payload["selection_method"] = method
+    for item, shape in zip(
+        cast(List[Dict[str, object]], payload.get("items", [])), selected_shapes
+    ):
+        item["original_selection_method"] = _selection_method_for_shape(shape)
+        query = getattr(shape, "_get_runtime", lambda *_args, **_kwargs: None)(
+            "selection.query"
+        )
+        order = getattr(shape, "_get_runtime", lambda *_args, **_kwargs: None)(
+            "selection.order"
+        )
+        if isinstance(query, dict):
+            item["selection_query_debug"] = query
+        if order is not None:
+            item["original_slice_position"] = int(order)
+    return payload
+
+
 def _selected_subshape_owner(shape: AnyShape, expected_type: type) -> Optional[AnyShape]:
     for parent in shape.get_parents():
         if isinstance(parent, expected_type):
@@ -614,6 +648,141 @@ def _resolve_selector_or_shapes(
     if isinstance(selection, ShapeSelector):
         return cast(List[AnyShape], selection.resolve(scope))
     return list(selection)
+
+
+def _common_selected_subshape_owner(
+    shapes: Sequence[AnyShape],
+    expected_type: type,
+) -> Optional[AnyShape]:
+    owner: Optional[AnyShape] = None
+    for shape in shapes:
+        shape_owner = _selected_subshape_owner(shape, expected_type)
+        if shape_owner is None:
+            return None
+        if owner is None:
+            owner = shape_owner
+            continue
+        try:
+            if shape_owner is owner or shape_owner.same_topology(owner):
+                continue
+        except Exception:
+            if shape_owner is owner:
+                continue
+        return None
+    return owner
+
+
+def _selected_subshape_owners(
+    shapes: Sequence[AnyShape],
+    expected_type: type,
+) -> Optional[List[AnyShape]]:
+    owners: List[AnyShape] = []
+    for shape in shapes:
+        owner = _selected_subshape_owner(shape, expected_type)
+        if owner is None:
+            return None
+        owners.append(owner)
+    return owners
+
+
+def _wire_selected_subshape_owner(wire: Wire) -> Optional[Solid]:
+    return _common_selected_subshape_owner(wire.get_edges(), Solid)
+
+
+def _wire_selected_subshapes(wire: Wire, *, role: str) -> Optional[Dict[str, object]]:
+    edges = wire.get_edges()
+    owner = _common_selected_subshape_owner(edges, Solid)
+    if owner is None:
+        return None
+    return _selected_subshapes_from_existing_shapes(
+        owner,
+        edges,
+        kind="edge",
+        role=role,
+    )
+
+
+def _selected_subshapes_from_existing_shape_owners(
+    owners: Sequence[AnyShape],
+    selected_shapes: Sequence[AnyShape],
+    *,
+    kind: str,
+    role: str,
+) -> Dict[str, object]:
+    if len(owners) != len(selected_shapes):
+        raise ValueError("owner and selected shape counts must match")
+    payload = _selected_subshapes_from_existing_shapes(
+        owners[0],
+        selected_shapes,
+        kind=kind,
+        role=role,
+    )
+    items = cast(List[Dict[str, object]], payload.get("items", []))
+    for item, owner in zip(items, owners):
+        source = _shape_source_payload(owner)
+        item["source"] = source
+        item["source_shape_node"] = source.get("node_id")
+    unique_sources: List[Dict[str, object]] = []
+    seen: set[tuple[object, object, object]] = set()
+    for owner in owners:
+        source = _shape_source_payload(owner)
+        key = (source.get("graph_id"), source.get("node_id"), source.get("output_slot", 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_sources.append(source)
+    payload["sources"] = unique_sources
+    if len(unique_sources) == 1:
+        payload["source"] = unique_sources[0]
+        payload["source_shape_node"] = unique_sources[0].get("node_id")
+    else:
+        payload["source"] = {}
+        payload["source_shape_node"] = None
+    return payload
+
+
+def _selected_subshape_payload_for_shape(
+    shape: AnyShape,
+    *,
+    role_prefix: str,
+) -> tuple[Optional[Dict[str, object]], Optional[AnyShape], Optional[str]]:
+    if isinstance(shape, Edge):
+        owner = _selected_subshape_owner(shape, Solid)
+        if owner is None:
+            return None, None, None
+        return (
+            _selected_subshape_from_existing_shape(
+                owner,
+                shape,
+                kind="edge",
+                role=f"{role_prefix}_source_edge",
+            ),
+            owner,
+            "edge",
+        )
+    if isinstance(shape, Face):
+        owner = _selected_subshape_owner(shape, Solid)
+        if owner is None:
+            return None, None, None
+        return (
+            _selected_subshape_from_existing_shape(
+                owner,
+                shape,
+                kind="face",
+                role=f"{role_prefix}_source_face",
+            ),
+            owner,
+            "face",
+        )
+    if isinstance(shape, Wire):
+        owner = _wire_selected_subshape_owner(shape)
+        selected_edges = _wire_selected_subshapes(
+            shape, role=f"{role_prefix}_source_edge"
+        )
+        if owner is None or selected_edges is None:
+            return None, None, None
+        return selected_edges, owner, "wire"
+    return None, None, None
 
 
 def _serialize_selection_query(
@@ -1270,13 +1439,21 @@ def make_face_from_wire_rface(
         face._tags = wire._tags.copy()
         face._metadata = wire._metadata.copy()
 
+        params: Dict[str, object] = {"normal": normal}
+        input_shapes: Sequence[AnyShape] = [wire]
+        selected_edges = _wire_selected_subshapes(wire, role="face_boundary_edge")
+        owner = _wire_selected_subshape_owner(wire)
+        if selected_edges is not None and owner is not None:
+            params["selected_subshapes"] = selected_edges
+            input_shapes = [owner]
+
         return cast(
             Face,
             _finalize_derived_shape(
                 face,
                 op=_OP_MAKE_FACE_FROM_WIRE_RFACE,
-                params={"normal": normal},
-                input_shapes=[wire],
+                params=params,
+                input_shapes=input_shapes,
                 tags={"derived", "face"},
             ),
         )
@@ -1584,13 +1761,24 @@ def make_wire_from_edges_rwire(edges: List[Edge]) -> Wire:
             raise ValueError("边列表不能为空")
 
         wire_shape = make_wire_from_edges_ocp([edge.wrapped for edge in edges])
+        params: Dict[str, object] = {"edge_count": len(edges)}
+        input_shapes: Sequence[AnyShape] = edges
+        owners = _selected_subshape_owners(edges, Solid)
+        if owners is not None:
+            params["selected_subshapes"] = _selected_subshapes_from_existing_shape_owners(
+                owners,
+                edges,
+                kind="edge",
+                role="wire_edge",
+            )
+            input_shapes = owners
         return cast(
             Wire,
             _finalize_derived_shape(
                 Wire(wire_shape),
                 op=_OP_MAKE_WIRE_FROM_EDGES_RWIRE,
-                params={"edge_count": len(edges)},
-                input_shapes=edges,
+                params=params,
+                input_shapes=input_shapes,
                 tags={"derived", "wire"},
             ),
         )
@@ -2618,11 +2806,22 @@ def translate_shape(shape: AnyShape, vector: Tuple[float, float, float]) -> AnyS
         new_shape._tags = shape._tags.copy()
         new_shape._metadata = shape._metadata.copy()
         _copy_runtime_state(shape, new_shape)
+        params: Dict[str, object] = {"vector": vector}
+        input_shapes: Sequence[AnyShape] = [shape]
+        selection_payload, owner, selected_kind = _selected_subshape_payload_for_shape(
+            shape, role_prefix="translate"
+        )
+        if selection_payload is not None and owner is not None:
+            params["selected_subshapes"] = selection_payload
+            if selected_kind is not None:
+                params["selected_source_kind"] = selected_kind
+            input_shapes = [owner]
+
         record_operation_if_active(
             op=_OP_MAKE_TRANSLATE_RSHAPE,
-            params={"vector": vector},
+            params=params,
             outputs=new_shape,
-            input_shapes=[shape],
+            input_shapes=input_shapes,
             context=_current_context_metadata(),
         )
 
@@ -2698,11 +2897,22 @@ def rotate_shape(
             new_shape._tags = shape._tags.copy()
             new_shape._metadata = shape._metadata.copy()
             _copy_runtime_state(shape, new_shape)
+            params: Dict[str, object] = {"angle": angle, "axis": axis, "origin": origin}
+            input_shapes: Sequence[AnyShape] = [shape]
+            selection_payload, owner, selected_kind = _selected_subshape_payload_for_shape(
+                shape, role_prefix="rotate"
+            )
+            if selection_payload is not None and owner is not None:
+                params["selected_subshapes"] = selection_payload
+                if selected_kind is not None:
+                    params["selected_source_kind"] = selected_kind
+                input_shapes = [owner]
+
             record_operation_if_active(
                 op=_OP_MAKE_ROTATE_RSHAPE,
-                params={"angle": angle, "axis": axis, "origin": origin},
+                params=params,
                 outputs=new_shape,
-                input_shapes=[shape],
+                input_shapes=input_shapes,
                 context=_current_context_metadata(),
             )
 
@@ -2807,16 +3017,28 @@ def extrude_rsolid(
         solid.add_tag("extrusion solid")
         solid._metadata = profile._metadata.copy()
 
+        params: Dict[str, object] = {
+            "direction": direction,
+            "distance": distance,
+        }
+        input_shapes: Sequence[AnyShape] = [profile]
+        profile_owner = _selected_subshape_owner(face, Solid)
+        if profile_owner is not None:
+            params["selected_subshapes"] = _selected_subshape_from_existing_shape(
+                profile_owner,
+                face,
+                kind="face",
+                role="extrude_profile_face",
+            )
+            input_shapes = [profile_owner]
+
         return _finalize_tracked_solid(
             solid,
             op=_OP_MAKE_EXTRUDE_RSOLID,
-            params={
-                "direction": direction,
-                "distance": distance,
-            },
+            params=params,
             delta=tracked.delta,
             delta_entries=cast(Dict[str, Dict[str, object]], tracked.delta_entries),
-            input_shapes=[profile],
+            input_shapes=input_shapes,
         )
     except Exception as e:
         _wrap_public_api_error(
@@ -2888,17 +3110,29 @@ def revolve_rsolid(
         solid._tags = profile._tags.copy()
         solid._metadata = profile._metadata.copy()
 
+        params = {
+            "axis": axis,
+            "angle": angle,
+            "origin": origin,
+        }
+        input_shapes = [profile]
+        profile_owner = _selected_subshape_owner(face, Solid)
+        if profile_owner is not None:
+            params["selected_subshapes"] = _selected_subshape_from_existing_shape(
+                profile_owner,
+                face,
+                kind="face",
+                role="revolve_profile_face",
+            )
+            input_shapes = [profile_owner]
+
         return _finalize_tracked_solid(
             solid,
             op=_OP_MAKE_REVOLVE_RSOLID,
-            params={
-                "axis": axis,
-                "angle": angle,
-                "origin": origin,
-            },
+            params=params,
             delta=tracked.delta,
             delta_entries=cast(Dict[str, Dict[str, object]], tracked.delta_entries),
-            input_shapes=[profile],
+            input_shapes=input_shapes,
         )
     except Exception as e:
         _wrap_public_api_error(
@@ -4226,13 +4460,33 @@ def loft_rsolid(profiles: List[Wire], ruled: bool = False) -> Solid:
         result._tags = all_tags
         result._metadata = all_metadata
 
+        params: Dict[str, object] = {"profile_count": len(profiles), "ruled": ruled}
+        input_shapes: Sequence[AnyShape] = profiles
+        selected_profile_edges: List[Dict[str, object]] = []
+        profile_owners: List[AnyShape] = []
+        for profile_index, profile in enumerate(profiles):
+            owner = _wire_selected_subshape_owner(profile)
+            selected_edges = _wire_selected_subshapes(
+                profile,
+                role=f"loft_profile_{profile_index}_edge",
+            )
+            if owner is None or selected_edges is None:
+                selected_profile_edges = []
+                profile_owners = []
+                break
+            selected_profile_edges.append(selected_edges)
+            profile_owners.append(owner)
+        if selected_profile_edges:
+            params["selected_profile_subshapes"] = selected_profile_edges
+            input_shapes = profile_owners
+
         return _finalize_tracked_solid(
             result,
             op=_OP_MAKE_LOFT_RSOLID,
-            params={"profile_count": len(profiles), "ruled": ruled},
+            params=params,
             delta=tracked.delta,
             delta_entries=cast(Dict[str, Dict[str, object]], tracked.delta_entries),
-            input_shapes=profiles,
+            input_shapes=input_shapes,
         )
     except Exception as e:
         _wrap_public_api_error(
@@ -4274,6 +4528,11 @@ def sweep_rsolid(profile: Face, path: Wire, is_frenet: bool = False) -> Solid:
                 role="sweep_profile_face",
             )
             input_shapes = [profile_owner, path]
+        path_owner = _wire_selected_subshape_owner(path)
+        selected_path_edges = _wire_selected_subshapes(path, role="sweep_path_edge")
+        if selected_path_edges is not None and path_owner is not None:
+            params["selected_path_subshapes"] = selected_path_edges
+            input_shapes = [input_shapes[0], path_owner]
 
         return _finalize_tracked_solid(
             result,
@@ -4525,14 +4784,25 @@ def mirror_shape(
         new_shape.add_tag("mirrored")
 
         _attach_track_summary(new_shape, op=_OP_MAKE_MIRROR_RSHAPE)
+        params: Dict[str, object] = {
+            "plane_origin": plane_origin,
+            "plane_normal": plane_normal,
+        }
+        input_shapes: Sequence[AnyShape] = [shape]
+        selection_payload, owner, selected_kind = _selected_subshape_payload_for_shape(
+            shape, role_prefix="mirror"
+        )
+        if selection_payload is not None and owner is not None:
+            params["selected_subshapes"] = selection_payload
+            if selected_kind is not None:
+                params["selected_source_kind"] = selected_kind
+            input_shapes = [owner]
+
         record_operation_if_active(
             op=_OP_MAKE_MIRROR_RSHAPE,
-            params={
-                "plane_origin": plane_origin,
-                "plane_normal": plane_normal,
-            },
+            params=params,
             outputs=new_shape,
-            input_shapes=[shape],
+            input_shapes=input_shapes,
             context=_current_context_metadata(),
         )
 

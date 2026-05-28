@@ -113,19 +113,38 @@ def _extract_input_nodes(inputs: Optional[Iterable[Any]]) -> List[OperationNode]
         return []
 
     nodes: List[OperationNode] = []
-    seen: Set[str] = set()
+    def _append_node(node: Any) -> None:
+        if node is None:
+            return
+        node_id = getattr(node, "node_id", None)
+        if node_id is None:
+            return
+        nodes.append(node)
+
     for obj in inputs:
         if obj is None:
             continue
         node = getattr(obj, "_get_runtime", lambda *_args, **_kwargs: None)(
             "graph.node"
         )
-        if node is None:
+        _append_node(node)
+        if node is not None:
             continue
-        if node.node_id in seen:
+
+        topo_ref = getattr(obj, "_get_runtime", lambda *_args, **_kwargs: None)(
+            "topo.ref"
+        )
+        node_id = getattr(topo_ref, "node_id", None)
+        if not node_id:
+            topo_ref_meta = getattr(obj, "get_metadata", lambda *_args, **_kwargs: None)(
+                "topo_ref"
+            )
+            if isinstance(topo_ref_meta, dict):
+                node_id = topo_ref_meta.get("node_id")
+        session = get_active_session()
+        if session is None or not node_id:
             continue
-        seen.add(node.node_id)
-        nodes.append(node)
+        _append_node(session.graph.get_node(str(node_id)))
     return nodes
 
 

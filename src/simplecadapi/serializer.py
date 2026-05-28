@@ -1033,6 +1033,65 @@ def _resolve_faces_from_selected_subshapes(
     return match_selected_subshape_items(solid.get_faces(), items, kind="face")
 
 
+def _resolve_single_selected_source_shape(
+    owner: Solid,
+    params: Dict[str, Any],
+    *,
+    edge_role: str,
+    face_role: str,
+) -> AnyShape:
+    edge_items = selected_subshape_items(params, kind="edge", role=edge_role)
+    if edge_items:
+        edges = match_selected_subshape_items(owner.get_edges(), edge_items, kind="edge")
+        if str(params.get("selected_source_kind", "")).lower() == "wire":
+            return ops.make_wire_from_edges_rwire(edges)
+        if edges:
+            return edges[0]
+    face_items = selected_subshape_items(params, kind="face", role=face_role)
+    if face_items:
+        faces = match_selected_subshape_items(owner.get_faces(), face_items, kind="face")
+        if faces:
+            return faces[0]
+    return owner
+
+
+def _resolve_edges_from_selection_payload(
+    solid: Solid, payload: Dict[str, Any]
+) -> List[Edge]:
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    return match_selected_subshape_items(solid.get_edges(), items, kind="edge")
+
+
+def _resolve_edges_from_source_items(
+    outputs: Dict[str, List[AnyShape]],
+    payload: Dict[str, Any],
+) -> List[Edge]:
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    edges: List[Edge] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("source")
+        source_node_id = source.get("node_id") if isinstance(source, dict) else None
+        if source_node_id is None:
+            return []
+        owner_outputs = outputs.get(str(source_node_id), [])
+        if not owner_outputs:
+            return []
+        edges.extend(
+            match_selected_subshape_items(
+                cast(Solid, owner_outputs[0]).get_edges(),
+                [item],
+                kind="edge",
+            )
+        )
+    return edges
+
+
 def _execute_graph(
     graph: OperationGraph, leaf_node_ids: Optional[Sequence[str]] = None
 ) -> List[AnyShape]:
@@ -1094,9 +1153,21 @@ def _execute_graph(
                 continue
 
             if op_name == "make_face_from_wire_rface":
-                wire_outputs = (
-                    outputs.get(node.inputs[0].node_id, []) if node.inputs else []
+                wire_outputs: List[AnyShape] = []
+                boundary_items = selected_subshape_items(
+                    params, kind="edge", role="face_boundary_edge"
                 )
+                if boundary_items and node.inputs:
+                    owner_outputs = outputs.get(node.inputs[0].node_id, [])
+                    if owner_outputs:
+                        edges = match_selected_subshape_items(
+                            cast(Solid, owner_outputs[0]).get_edges(),
+                            boundary_items,
+                            kind="edge",
+                        )
+                        wire_outputs.append(ops.make_wire_from_edges_rwire(edges))
+                elif node.inputs:
+                    wire_outputs = outputs.get(node.inputs[0].node_id, [])
                 if wire_outputs:
                     result = ops.make_face_from_wire_rface(
                         cast(Any, wire_outputs[0]),
@@ -1107,8 +1178,17 @@ def _execute_graph(
 
             if op_name == "make_wire_from_edges_rwire":
                 edge_outputs: List[AnyShape] = []
-                for inp in node.inputs:
-                    edge_outputs.extend(outputs.get(inp.node_id, []))
+                edge_items = selected_subshape_items(params, kind="edge", role="wire_edge")
+                if edge_items:
+                    edge_outputs.extend(
+                        _resolve_edges_from_source_items(
+                            outputs,
+                            cast(Dict[str, Any], params.get("selected_subshapes", {})),
+                        )
+                    )
+                else:
+                    for inp in node.inputs:
+                        edge_outputs.extend(outputs.get(inp.node_id, []))
                 if edge_outputs:
                     result = ops.make_wire_from_edges_rwire(cast(Any, edge_outputs))
                     _store_outputs(node, result)
@@ -1119,8 +1199,14 @@ def _execute_graph(
                     outputs.get(node.inputs[0].node_id, []) if node.inputs else []
                 )
                 if input_outputs:
+                    shape = _resolve_single_selected_source_shape(
+                        cast(Solid, input_outputs[0]),
+                        params,
+                        edge_role="translate_source_edge",
+                        face_role="translate_source_face",
+                    )
                     result = ops.translate_shape(
-                        cast(AnyShape, input_outputs[0]),
+                        cast(AnyShape, shape),
                         cast(Any, tuple(params.get("vector", (0, 0, 0)))),
                     )
                     _store_outputs(node, result)
@@ -1131,8 +1217,14 @@ def _execute_graph(
                     outputs.get(node.inputs[0].node_id, []) if node.inputs else []
                 )
                 if input_outputs:
+                    shape = _resolve_single_selected_source_shape(
+                        cast(Solid, input_outputs[0]),
+                        params,
+                        edge_role="rotate_source_edge",
+                        face_role="rotate_source_face",
+                    )
                     result = ops.rotate_shape(
-                        cast(AnyShape, input_outputs[0]),
+                        cast(AnyShape, shape),
                         params.get("angle", 0.0),
                         axis=cast(Any, tuple(params.get("axis", (0, 0, 1)))),
                         origin=cast(Any, tuple(params.get("origin", (0, 0, 0)))),
@@ -1145,8 +1237,19 @@ def _execute_graph(
                     outputs.get(node.inputs[0].node_id, []) if node.inputs else []
                 )
                 if profile_outputs:
+                    profile = profile_outputs[0]
+                    face_items = selected_subshape_items(
+                        params, kind="face", role="extrude_profile_face"
+                    )
+                    if face_items:
+                        matched_faces = match_selected_subshape_items(
+                            cast(Solid, profile).get_faces(),
+                            face_items,
+                            kind="face",
+                        )
+                        profile = matched_faces[0]
                     result = ops.extrude_rsolid(
-                        cast(Any, profile_outputs[0]),
+                        cast(Any, profile),
                         cast(Any, tuple(params.get("direction", (0, 0, 1)))),
                         params.get("distance", 1.0),
                     )
@@ -1158,8 +1261,19 @@ def _execute_graph(
                     outputs.get(node.inputs[0].node_id, []) if node.inputs else []
                 )
                 if profile_outputs:
+                    profile = profile_outputs[0]
+                    face_items = selected_subshape_items(
+                        params, kind="face", role="revolve_profile_face"
+                    )
+                    if face_items:
+                        matched_faces = match_selected_subshape_items(
+                            cast(Solid, profile).get_faces(),
+                            face_items,
+                            kind="face",
+                        )
+                        profile = matched_faces[0]
                     result = ops.revolve_rsolid(
-                        cast(Any, profile_outputs[0]),
+                        cast(Any, profile),
                         axis=cast(Any, tuple(params.get("axis", (0, 0, 1)))),
                         angle=params.get("angle", 360),
                         origin=cast(Any, tuple(params.get("origin", (0, 0, 0)))),
@@ -1169,8 +1283,21 @@ def _execute_graph(
 
             if op_name == "make_loft_rsolid":
                 profile_outputs: List[AnyShape] = []
-                for inp in node.inputs:
-                    profile_outputs.extend(outputs.get(inp.node_id, []))
+                selected_profiles = params.get("selected_profile_subshapes")
+                if isinstance(selected_profiles, list) and node.inputs:
+                    for inp, selection_payload in zip(node.inputs, selected_profiles):
+                        owner_outputs = outputs.get(inp.node_id, [])
+                        if owner_outputs and isinstance(selection_payload, dict):
+                            edges = _resolve_edges_from_selection_payload(
+                                cast(Solid, owner_outputs[0]), selection_payload
+                            )
+                            if edges:
+                                profile_outputs.append(
+                                    ops.make_wire_from_edges_rwire(edges)
+                                )
+                else:
+                    for inp in node.inputs:
+                        profile_outputs.extend(outputs.get(inp.node_id, []))
                 if profile_outputs:
                     result = ops.loft_rsolid(
                         cast(Any, profile_outputs), ruled=params.get("ruled", False)
@@ -1182,6 +1309,14 @@ def _execute_graph(
                 if len(node.inputs) >= 2:
                     profile_outputs = outputs.get(node.inputs[0].node_id, [])
                     path_outputs = outputs.get(node.inputs[1].node_id, [])
+                    path_payload = params.get("selected_path_subshapes")
+                    if isinstance(path_payload, dict) and path_outputs:
+                        edges = _resolve_edges_from_selection_payload(
+                            cast(Solid, path_outputs[0]), path_payload
+                        )
+                        path_outputs = [
+                            ops.make_wire_from_edges_rwire(edges)
+                        ] if edges else []
                     if profile_outputs and path_outputs:
                         profile = profile_outputs[0]
                         face_items = selected_subshape_items(
@@ -1207,8 +1342,14 @@ def _execute_graph(
                     outputs.get(node.inputs[0].node_id, []) if node.inputs else []
                 )
                 if input_outputs:
+                    shape = _resolve_single_selected_source_shape(
+                        cast(Solid, input_outputs[0]),
+                        params,
+                        edge_role="mirror_source_edge",
+                        face_role="mirror_source_face",
+                    )
                     result = ops.mirror_shape(
-                        cast(Any, input_outputs[0]),
+                        cast(Any, shape),
                         cast(Any, tuple(params.get("plane_origin", (0, 0, 0)))),
                         cast(Any, tuple(params.get("plane_normal", (0, 0, 1)))),
                     )
